@@ -1,365 +1,1017 @@
-GStreamer の `rtpjitterbuffer` エレメントは、ネットワーク経由で受信される RTP (Real-time Transport Protocol) パケットの到着時刻の揺らぎ（ジッター）、順序の入れ替わり、重複、ロスといった問題を緩和し、スムーズなメディア再生を実現するための重要なコンポーネントです。
+GStreamer の `rtpjitterbuffer` エレメントは、ネットワークソースから受信した RTP (Real-time Transport Protocol) パケットのジッター（到着時間の揺らぎ）を吸収し、パケットの並べ替えや重複パケットの削除を行う重要なコンポーネントです。これにより、メディアストリームの再生品質を向上させます。
 
-提供されたソースコード (`gstrtpjitterbuffer.c`/`h` および `rtpjitterbuffer.c`/`h`) に基づいて、その仕組みと機能を解説します。
+### `rtpjitterbuffer` の主な機能と詳細
 
-### `rtpjitterbuffer` エレメントの構造
+`rtpjitterbuffer` エレメントの主な機能と、関連するソースコード内の記述は以下の通りです。
 
-このエレメントは、2つの主要な部分から構成されています。
+* **パケットの並べ替えと重複排除**:
+    * ネットワーク経由で受信される RTP パケットは、順序通りに到着するとは限りません。また、同じパケットが複数回届くこともあります。`rtpjitterbuffer` は、これらのパケットをシーケンス番号に基づいて並べ替え、重複したパケットを破棄します。
 
-1.  **`GstRtpJitterBuffer` (`gstrtpjitterbuffer.c`/`h`)**:
-    * GStreamer のエレメントとしてのラッパー部分です。`GstElement` を継承し、プロパティ、シグナル、パッド（`sink` と `src`）の管理、状態変化への対応、イベント処理など、GStreamerフレームワークとの連携を担当します。
-    * 内部にコアとなるジッターバッファライブラリのインスタンス (`priv->jbuf`) を保持します。
+* **ジッター吸収とレイテンシ**:
+    * `latency` プロパティで設定された時間（デフォルトでは 200 ミリ秒）だけパケットをバッファリングし、ネットワークジッターを吸収します。
+    * `drop-on-latency` プロパティが TRUE の場合、バッファがレイテンシで設定された上限に達すると、最も古いパケットから破棄します。
 
-2.  **`RTPJitterBuffer` (`rtpjitterbuffer.c`/`h`)**:
-    * 実際のジッターバッファリング、パケットの並べ替え、タイムスタンプ処理、同期ロジックなどを実装するコアライブラリです。
-    * `GstRtpJitterBuffer` エレメントから独立して使用することも可能なように設計されている汎用的なジッターバッファです。
+* **欠落パケットの処理 (`do-lost`)**:
+    * `do-lost` プロパティが TRUE の場合、パケットが設定されたレイテンシ時間内に到着せず、欠落したと判断されると、`GstRTPPacketLost` という名前のカスタムシリアライズイベントを下流に送信します。
+    * このイベントは、デペイローダーなどのエレメントがパケット欠損時のデータを補間生成するなどの処理に利用されます。
 
-### 主な目的と機能
+* **再送要求 (`do-retransmission`)**:
+    * `do-retransmission` プロパティが TRUE の場合、パケットが期待される時間に到着しないと判断されると、`GstRTPRetransmissionRequest` という名前のカスタムアップストリームイベントを送信し、再送を要求します。
+    * 再送要求のタイミングやリトライ間隔、リトライ期間などは、以下のプロパティで細かく制御できます:
+        * `rtx-delay`: パケットが期待通りに到着しなかった場合に、再送イベントを送信するまでの追加待機時間。
+        * `rtx-min-delay`: 再送イベントを送信するまでの最小追加待機時間。
+        * `rtx-delay-reorder`: この値以上のパケット並び替えが発生した場合に再送イベントを送信するとみなす。
+        * `rtx-retry-timeout`: 再送イベント送信後、この時間内にパケットが受信されなかった場合に再送イベントを再試行するタイムアウト。
+        * `rtx-min-retry-timeout`: `rtx-retry-timeout` が自動(-1)の場合の、リトライタイムアウトの最小間隔。
+        * `rtx-retry-period`: 再送を取得しようとする期間。
+        * `rtx-max-retries`: 再送要求の最大リトライ回数。
+        * `rtx-deadline`: 有効な RTX リクエストのデッドライン（ミリ秒）。
 
-`rtpjitterbuffer` の主な目的は、不安定なネットワーク環境でも高品質なRTPストリーミングを実現することです。そのために以下の機能を提供します。
+* **タイムスタンプ処理**:
+    * 入力バッファの DTS (Decoding Time Stamp) または PTS (Presentation Time Stamp) と、RTP パケット内の RTP タイムスタンプを使用して、出力バッファの PTS を生成します。
+    * `ts-offset` プロパティにより、出力バッファのタイムスタンプを調整できます。これは主にストリーム間の同期に使用されます。
+    * `max-ts-offset-adjustment` プロパティで、フレームごとのタイムスタンプオフセットの最大調整量を設定できます。
 
-1.  **ジッター吸収 (Jitter Absorption)**:
-    * 受信したRTPパケットを一定期間内部のバッファに保持することで、ネットワーク遅延の変動（ジッター）を吸収します。これにより、パケットの到着間隔が平滑化され、再生がスムーズになります。
-    * バッファリングする時間は `latency` プロパティで設定できます。
+* **クロックレートの取得**:
+    * RTP ペイロードのクロックレート情報を必要とします。これは、シンクパッドの Caps から取得するか、Caps がない場合は `request-pt-map` シグナルを通じて取得します。
+    * `clear-pt-map` シグナルで以前のペイロードタイプマップをクリアできます。
 
-2.  **パケットの並べ替え (Reordering)**:
-    * RTPパケットはネットワーク経路の違いなどにより、送信された順序とは異なる順序で到着することがあります。
-    * `rtpjitterbuffer` は、各RTPパケットのヘッダに含まれるシーケンス番号（Sequence Number）を監視し、正しい順序に並べ替えてから下流のエレメントに渡します。
+* **統計情報 (`stats`)**:
+    * `stats` プロパティを通じて、プッシュされたパケット数、損失パケット数、遅延パケット数、重複パケット数、再送要求数、再送成功数などの統計情報を取得できます。
 
-3.  **重複パケットの除去 (Duplicate Removal)**:
-    * 同じシーケンス番号を持つパケットが複数到着した場合、重複とみなして破棄します。
+* **モード (`mode`)**:
+    * `mode` プロパティで、バッファリングとタイムスタンプのアルゴリズムを制御できます。デフォルトは `slave` モードです。
 
-4.  **タイムスタンプに基づくスケジューリングと同期**:
-    * RTPパケットのRTPタイムスタンプと、RTCP Sender Report (SR) パケットに含まれるNTPタイムスタンプおよび対応するRTPタイムスタンプのマッピング情報を使用して、各パケットが再生されるべき「絶対時刻」を計算します。
-    * 計算された時刻になるまでパケットの送出を遅延させ、送信側のクロックレートと受信側の再生クロックを同期させようとします。これにより、長期間の再生でも音ズレや映像の早送り/スローダウンを防ぎます。
-    * この機能は主に `mode` プロパティが `GST_RTP_JITTER_BUFFER_MODE_SLAVE` (デフォルト) の場合に有効です。
+* **`rtpbin` との連携**:
+    * `rtpjitterbuffer` は、RTP セッション管理を行う `rtpbin` エレメントの内部で自動的に使用されます。
 
-5.  **パケットロス処理 (Packet Loss Handling)**:
-    * シーケンス番号の抜けを検出することでパケットロスを認識します。
-    * `do-lost` プロパティが `TRUE` の場合、失われたパケットの代わりに「lost」とマークされた空のバッファを下流に送出し、下流のエレメント（例: デコーダ）がロスを認識してエラーコンシールメント処理などを行えるようにします。
+### パッド
 
-### `GstRtpJitterBuffer` エレメントの動作
+`rtpjitterbuffer` エレメントは以下のパッドを持ちます:
 
-1.  **初期化 (`gst_rtp_jitter_buffer_class_init`, `gst_rtp_jitter_buffer_init`)**:
-    * プロパティ（後述）やパッドテンプレートなどを定義します。
-    * 内部で `RTPJitterBuffer` オブジェクト (`priv->jbuf`) を `rtp_jitter_buffer_new()` で作成します。
+* **`sink`**: RTP パケットを受信する常時接続のシンクパッド。`application/x-rtp` の Caps を持ちます。
+* **`sink_rtcp`**: RTCP (RTP Control Protocol) パケットを受信する要求パッド。`application/x-rtcp` の Caps を持ちます。
+* **`src`**: ジッター補正および並べ替え処理後の RTP パケットを出力する常時接続のソースパッド。`application/x-rtp` の Caps を持ちます。
 
-2.  **パケット受信 (シンクパッドのチェーン関数: `gst_rtp_jitter_buffer_chain`)**:
-    * 上流からRTPパケット (`GstBuffer`) を受信すると、まず `gst_rtp_buffer_map()` を使ってRTPパケット情報を解析します（シーケンス番号、タイムスタンプ、SSRCなど）。
-    * 解析した情報と共にパケットを `rtp_jitter_buffer_add(priv->jbuf, buffer, seqnum, timestamp, ...)` 関数を使って内部の `RTPJitterBuffer` に追加します。
+### 使用例
 
-3.  **イベント処理**:
-    * **シンクパッド (`gst_rtp_jitter_buffer_sink_event`)**:
-        * 特に `GST_EVENT_RTCP_BUFFER` をリッスンし、RTCP SR (Sender Report) パケットを受信すると、その情報を `rtp_jitter_buffer_set_syncinfo(priv->jbuf, ssrc, clock_rate, sr_ntptime, sr_rtptime, ...)` に渡して、内部の同期情報を更新します。これにより、RTPタイムスタンプとNTP実時間とのマッピング精度が向上します。
-        * `GST_EVENT_CAPS` を受信すると、ペイロードタイプからクロックレートを取得し、`rtp_jitter_buffer_set_clock_rate()` で内部バッファに設定します。
-    * **ソースパッド (`gst_rtp_jitter_buffer_src_event`)**:
-        * 下流からの `GST_EVENT_CUSTOM_DOWNSTREAM` イベント（"GstRTPJitterBufferLatency", "GstRTPJitterBufferMode"）を処理し、動的に `latency` や `mode` を変更できます。
+`rtpjitterbuffer` は、RTP ストリームを受信する際に、ネットワークの揺らぎを吸収し、安定したメディア再生を実現するために不可欠なエレメントです。テストコード (`tests/check/elements/rtpjitterbuffer.c`) では、様々なシーケンスのパケット（順序通り、逆順、順不同など）をプッシュし、`rtpjitterbuffer` が正しく並べ替えて出力することを確認するテストケースが含まれています。また、パケットロスイベントや再送要求イベントのテストも行われています。
 
-4.  **パケット送出ループ (`gst_rtp_jitter_buffer_loop`)**:
-    * このエレメントは、通常、独自の内部スレッド（`priv->task`）で `gst_rtp_jitter_buffer_loop()` 関数を実行します。
-    * このループ関数は、定期的に `RTPJitterBuffer` (`priv->jbuf`) の状態を確認します。
-    * `rtp_jitter_buffer_get_packet(priv->jbuf, &next_release_time, &is_lost)` を呼び出し、次に出力すべきパケットとその再生時刻 `next_release_time` を取得します。
-    * 現在のパイプラインクロック時刻が `next_release_time` に達するまで待機します（または、`next_release_time` が過去の場合は即座に）。
-    * 時刻が来たら、取得したパケットを下流にプッシュします (`gst_pad_push(GST_ELEMENT_SRCPAD(jbuf), outbuf)`)。
-    * パケットのPTSは、`rtp_jitter_buffer_calculate_pts()` を使って、RTPタイムスタンプと同期情報に基づいて計算されます。
+この情報は、提供された GStreamer プラグインリポジトリの `gst-plugins-good-1.16.3` ブランチのコードに基づいています。
 
-### `RTPJitterBuffer` コアライブラリの主要な仕組み
 
-* **`RTPJitterBufferItem`**:
-    * 個々のRTPパケットと、それに関連する情報（シーケンス番号、RTPタイムスタンプ、受信時刻、ヘッダ情報など）を格納する構造体です。
-    * 内部のリスト（`jbuf->packets`、`GList` で実装）にソートされて格納されます。
+> rtpjitterbufferにおける、出力バッファのPTSの計算方法を解説してください。
 
-* **パケットの追加 (`rtp_jitter_buffer_add_item`)**:
-    * 新しい `RTPJitterBufferItem` を作成し、シーケンス番号の拡張（ラップアラウンド対応）、重複チェック、順序の確認などを行います。
-    * 適切な位置に挿入します。`max_misorder_time` を超えるほど古いパケットはドロップされることがあります。
+`rtpjitterbuffer` エレメントにおける出力バッファの PTS (Presentation Time Stamp) の計算は、いくつかの要素と設定モードに基づいて行われます。主な処理は内部の `RTPJitterBuffer` オブジェクトの `rtp_jitter_buffer_calculate_pts` 関数と、それを利用する `gstrtpjitterbuffer.c` 内のロジックによって実行されます。
 
-* **同期情報の管理 (`jbuf->base_time`, `jbuf->base_extrtp`, `jbuf->skew`, `jbuf->clock_rate`)**:
-    * `base_time`: 最初に有効なパケットを受信したとき、または最初のRTCP SRに基づいて設定される、GStreamerのクロック時間（基準点）。
-    * `base_extrtp`: 上記 `base_time` に対応する拡張RTPタイムスタンプ（基準点）。
-    * `skew`: 送信側と受信側のクロックのずれや、ネットワーク伝搬遅延の初期推定値などを補正するための値。
-    * `clock_rate`: RTPストリームのクロックレート（例: オーディオなら8000Hzや48000Hz、ビデオなら90000Hz）。
-    * これらの値は、主に `rtp_jitter_buffer_set_syncinfo()` や最初のパケット到着時に初期化/更新されます。
+以下にその計算方法の主要なステップと考慮事項を解説します。
 
-* **PTS計算 (`rtp_jitter_buffer_calculate_pts`)**:
-    * この関数がRTPタイムスタンプをGStreamerのPTS (Presentation TimeStamp) に変換する核心部分です。
-    * `pts = base_time + skew + ((rtptime - base_extrtp) * GST_SECOND / clock_rate)` のような計算式が基本となります。
-    * `rtptime` は現在のパケットの拡張RTPタイムスタンプです。
-    * この計算により、RTPタイムスタンプの相対的な時間間隔が、GStreamerパイプラインの絶対的な時間軸（ランニングタイム）に正しくマッピングされます。
+### 1. 基本的なタイムスタンプの取得と変換
 
-* **出力パケットの決定 (`rtp_jitter_buffer_get_packet_internal`)**:
-    * バッファリング状態 (`jbuf->buffering_active`)、設定された `latency`、パケットのRTPタイムスタンプ、そして上記同期情報に基づいて、次に出力すべきパケットとその理想的なリリース時刻 (`next_release_time`) を決定します。
-    * `max_dropout_time` を超えるほどパケットが到着しない場合は、強制的にバッファリングを解除して出力を開始することもあります。
-    * `faststart_min_packets` の条件を満たせば、初期のバッファリング時間を短縮して早く再生を開始します。
+* **入力タイムスタンプ**:
+    * 入力バッファの DTS (Decoding Time Stamp) が主に使用されます。DTS がない場合は PTS が使用されます。
+    * これらのタイムスタンプが存在しない場合（例: ネットワークから受信したばかりのパケット）、現在のクロックから取得したランニングタイムが `dts` として使用されることがあります。
+    * `dts` は、エレメントのセグメント情報に基づいてランニングタイムに変換されます。
+* **RTP タイムスタンプ**:
+    * RTP パケットヘッダ内の `rtptime` が使用されます。
+    * この `rtptime` は、`clock-rate` を用いて GStreamer の時間単位 (ナノ秒) に変換された `gstrtptime` となります。
+    * 連続する RTP タイムスタンプのラップアラウンドを処理するために、拡張 RTP タイムスタンプ (`ext_rtptime`) が内部で維持されます。
 
-### 主要なプロパティとその役割
+### 2. `rtp_jitter_buffer_calculate_pts` 関数によるコア計算 (rtpjitterbuffer.c)
 
-`GstRtpJitterBuffer` エレメントは多くのプロパティを持ち、動作を細かく制御できます。以下はその一部です。
+この関数が PTS 計算の中心的な役割を担います。
 
-* **`latency` (デフォルト: 200 ms)**: 目標とするバッファリング遅延時間。この時間分のパケットをバッファに保持しようとします。
-* **`mode` (デフォルト: `GST_RTP_JITTER_BUFFER_MODE_SLAVE` (0))**:
-    * `GST_RTP_JITTER_BUFFER_MODE_SLAVE`: RTCP SR に基づいてクロック同期を行うモード。最も一般的なモード。
-    * `GST_RTP_JITTER_BUFFER_MODE_BUFFER` (1): 単純なバッファリングと並べ替えのみを行い、タイムスタンプの再同期は行いません。送信側と受信側のクロックが既に非常に正確に同期している場合や、RTCPが利用できない場合に使用されることがあります。
-    * `GST_RTP_JITTER_BUFFER_MODE_SYNCED` (2): 外部から提供される同期情報に追従するモード（特殊な用途）。
-* **`drop-on-latency` (デフォルト: `FALSE`)**: `latency` プロパティで設定された時間内に処理できないほど遅れて到着したパケットをドロップするかどうか。`TRUE` にすると、古いパケットを捨ててリアルタイム性を優先します。
-* **`do-lost` (デフォルト: `FALSE`)**: パケットロスを検出した場合、`GST_BUFFER_FLAG_GAP | GST_BUFFER_FLAG_DROPPABLE` フラグが設定された空のバッファを生成して下流に送るかどうか。
-* **`rtcp-sync-send-time` (デフォルト: `TRUE`)**: RTCP SRのNTPタイムスタンプを「送信時刻」として信頼するかどうか。ネットワークの対称性が仮定できない場合は `FALSE` にすることが推奨されることもあります。
-* **`max-dropout-time` (デフォルト: 0, 無効)**: この時間、連続してパケットが途切れた場合、バッファリングを強制的に終了して利用可能なパケットの出力を開始するまでの最大時間。
-* **`max-misorder-time` (デフォルト: 2000 ms)**: シーケンス番号が大きく前後しているパケット（misordered packet）を、ドロップせずにどれだけの期間保持するか。
-* **`rfc7273-sync` (デフォルト: `FALSE`)**: RFC7273 (RTPとPTPの同期) を使用するかどうか。
-* **`faststart-min-packets` (デフォルト: 0, 無効)**: ストリーム開始時に、この数のパケットが連続して到着したら、`latency` で設定された時間まで待たずに再生を開始する。
+* **初期同期とベースタイムスタンプ**:
+    * 最初に受信したパケット、またはリセット後の最初のパケットで、`jbuf->base_time` (GStreamer 時間の基準点) と `jbuf->base_rtptime` (RTP 時間の基準点、`gstrtptime` 形式) が設定されます。
+    * これらのベースタイムスタンプは、以降のパケットの相対的な時間を計算するための基準となります。
+    * `jbuf->need_resync` フラグが立っている場合や、特定の条件下（例: RTP タイムスタンプの大きなジャンプ）で、これらのベースタイムスタンプは再同期（リセット）されます。
+
+* **モード (`jbuf->mode`) に応じた処理**:
+    * **`RTP_JITTER_BUFFER_MODE_NONE` / `RTP_JITTER_BUFFER_MODE_BUFFER`**:
+        * 最初のパケットの `dts` は 0 とされ、それ以降のパケットの `dts` は -1 (無効) として扱われます。これにより、RTP タイムスタンプに基づいて 0 から始まるタイムスタンプが生成されます。`BUFFER` モードでは、バッファリング時間に応じてさらに調整が加わることがあります。
+    * **`RTP_JITTER_BUFFER_MODE_SYNCED`**:
+        * 最初のパケットの `dts` を基準とし、それ以降は RTP タイムスタンプに基づいて補間します。
+    * **`RTP_JITTER_BUFFER_MODE_SLAVE` (デフォルト)**:
+        * 受信したパケットの `dts` を使用して、送信側のクロックに対する受信側クロックのずれ（スキュー）を推定し、補正しようとします。
+
+* **クロックスキューの計算と補正 (`calculate_skew` 関数)**:
+    * `RTP_JITTER_BUFFER_MODE_SLAVE` モードなどで重要になります。
+    * 送信側での経過時間 (`send_diff` = 現在の `gstrtptime` - `jbuf->base_rtptime`) と、受信側での経過時間 (`recv_diff` = 現在の `dts` - `jbuf->base_time`) の差 (`delta`) を計算します。
+    * この `delta` の値を平滑化（ウィンドウ内の最小値を使用し、さらに平均化）してクロックスキュー (`jbuf->skew`) を推定します。
+    * 計算された PTS は `jbuf->base_time + send_diff + jbuf->skew` のように補正されます。
+    * 急激なスキューの変化はタイムスタンプのリセットを引き起こす可能性があります。
+
+* **RFC7273 同期**:
+    * `rfc7273-sync` プロパティが有効で、かつメディアクロック (`media_clock`) とそのオフセット (`media_clock_offset`) が提供されている場合、`rtpjitterbuffer` は受信ストリームを RFC7273 で定義された外部クロックに同期させようとします。
+    * このモードでは、NTP や PTP などの外部クロックソースから取得した時刻情報と RTP タイムスタンプを関連付けて PTS を計算します。これにより、ネットワーク遅延の変動によらない、より正確な同期が期待できます。
+
+* **タイムスタンプの単調増加の保証**:
+    * 計算された PTS が直前の出力 PTS (`jbuf->prev_out_time`) よりも小さい場合（タイムスタンプが逆行する場合）は、`jbuf->prev_out_time` が使用され、単調増加が保証されます。
+    * 同様に、入力 `dts` に対して計算された PTS が著しく早い場合（例: `pts + jbuf->delay < dts`）、サーバーが一時停止した可能性などを考慮し、ジッターバッファがリセットされ、`pts` が `dts` に設定されることがあります。
+
+### 3. `gstrtpjitterbuffer.c` での最終調整と出力
+
+`rtpjitterbuffer.c` で計算された PTS は、`gstrtpjitterbuffer.c` の `pop_and_push_next` 関数内でさらに調整されます。
+
+* **セグメント変換**:
+    * 計算されたランニングタイムとしての PTS は、現在のセグメント (`priv->segment`) を用いて、ストリームタイムに変換されます。
+* **オフセットの適用 (`apply_offset` 関数)**:
+    * **`ts-offset`**: `ts-offset` プロパティで設定された値が PTS に加算されます。これは主にストリーム間の同期（例: オーディオとビデオ）のために使用されます。
+    * **`out_offset`**: ジッターバッファがバッファリングモードからアクティブモードに移行する際などに計算される内部的なオフセットが加算されます。
+    * `max-ts-offset-adjustment` プロパティが設定されている場合、`ts-offset` の急激な変化を避けるために、フレームごとに段階的に調整が行われます。
+* **バッファフラグ**:
+    * パケットロスなどにより不連続が発生した場合は、出力バッファに `GST_BUFFER_FLAG_DISCONT` フラグが設定されます。
+    * タイムスタンプの大きな不連続や再同期が必要な場合は `GST_BUFFER_FLAG_RESYNC` フラグが設定されることがあります。
 
 ### まとめ
 
-`rtpjitterbuffer` は、GStreamerでRTPストリーミングを扱う上で非常に重要な役割を果たすエレメントです。ネットワークの不安定性（ジッター、ロス、順序入れ替え）を吸収し、RTPタイムスタンプとRTCP SR情報を活用して送信側のクロックに同期することで、高品質で安定したメディア再生を実現します。その動作は多くのプロパティによって細かく調整可能であり、アプリケーションの要件（低遅延優先か、安定性優先かなど）に応じて最適化することができます。
+`rtpjitterbuffer` の PTS 計算は、入力パケットの RTP タイムスタンプと到着時刻 (DTS)、設定された動作モード、クロックレート、オプションの外部メディアクロック、そして `ts-offset` などのプロパティ値を総合的に考慮して行われます。主な目的は、ネットワークジッターを吸収し、クロックスキューを補正し、他のストリームとの同期を取りながら、滑らかで正確なタイミングで下流にメディアバッファを供給することです。
 
-> latencyプロパティの設定値と処理への影響を詳しく解説してください。
 
-`rtpjitterbuffer` エレメントの `latency` プロパティは、ネットワークジッターを吸収するためにエレメントが内部でRTPパケットをどれだけの期間バッファリングしようとするかの目標値をミリ秒単位で指定します。この設定値は、リアルタイムストリーミングの品質（スムーズさ）と遅延（リアルタイム性）の間のトレードオフを調整する上で非常に重要です。
+> rtpjitterbufferにおけるlatencyプロパティの機能と処理に与える影響についてソースコードを例示しながら解説してください。
 
-提供されたソースコード (`gstrtpjitterbuffer.c` および `rtpjitterbuffer.c`) を基に、`latency` プロパティの設定値が処理に与える影響を詳しく解説します。
 
-### `latency` プロパティの定義と役割
+`rtpjitterbuffer` エレメントの `latency` プロパティは、ネットワークジッターを吸収するために RTP パケットをバッファリングする最大時間をミリ秒単位で指定します。この値は、エレメントがパケットをどれくらいの期間保持し、順序の入れ替えや欠落パケットの到着待ちを行うかを決定する上で非常に重要です。
 
-  * **定義**: `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_class_init()` 関数内で、`latency` プロパティは以下のように定義されています（デフォルト値は200ミリ秒）。
+デフォルト値は `200` ミリ秒です。
+
+### `latency` プロパティの機能
+
+1.  **ジッター吸収**: ネットワーク遅延の変動（ジッター）により、パケットの到着間隔が一定でなくなることがあります。`latency` プロパティで設定された時間だけパケットを内部バッファに保持することで、これらの到着時間の揺らぎを平滑化し、より安定したメディアストリームを下流に供給します。
+
+2.  **パケット並べ替えのための待機時間**: RTP パケットはネットワークの状況により順序通りに到着しないことがあります。`latency` は、後続のパケットが到着するのを待つ時間の上限となり、この時間内に到着したパケットはシーケンス番号に基づいて並べ替えられます。
+
+3.  **欠落パケットの判断基準**:
+
+      * `do-lost` プロパティが `TRUE` の場合、パケットが `latency` で設定された時間内に到着しないと「欠落した」と判断されます。
+      * この場合、`GstRTPPacketLost` という名前のカスタムイベントが下流に送信されます。
+
+4.  **再送要求のタイムアウト基準 (間接的)**:
+
+      * `do-retransmission` プロパティが `TRUE` の場合、`latency` は再送要求 (`rtx-retry-period`) の期間を決定する際の要素の一つとなり得ます。具体的には、`rtx-retry-period` が自動設定 (-1) の場合、`latency` と観測されたラウンドトリップタイムに基づいて再送を試みる期間が推定されます。
+
+5.  **バッファ管理 (`drop-on-latency`)**:
+
+      * `drop-on-latency` プロパティが `TRUE` の場合、ジッターバッファ内のデータ量が `latency` で指定された時間分を超過しないように、最も古いパケットから破棄します。
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_chain` 関数内で、`drop-on-latency` が有効で、かつ内部バッファ (`priv->jbuf`) の保持期間 (`rtp_jitter_buffer_get_ts_diff`) が設定された `latency_ns` を超えた場合に、古いアイテムをドロップする処理があります。
+
+    <!-- end list -->
 
     ```c
-    // gstrtpjitterbuffer.c
-    g_object_class_install_property (gobject_class, PROP_LATENCY,
-        g_param_spec_uint ("latency", "Latency",
-            "Amount of ms to buffer",
-            0, G_MAXUINT, DEFAULT_LATENCY,
-            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS |
-            GST_PARAM_MUTABLE_PLAYING));
+    /* gstrtpjitterbuffer.c */
+    if (priv->latency_ms && priv->drop_on_latency) {
+        latency_ts =
+            gst_util_uint64_scale_int (priv->latency_ms, priv->clock_rate, 1000);
+
+        if (G_UNLIKELY (rtp_jitter_buffer_get_ts_diff (priv->jbuf) >= latency_ts)) {
+          RTPJitterBufferItem *old_item;
+
+          old_item = rtp_jitter_buffer_peek (priv->jbuf);
+
+          if (IS_DROPABLE (old_item)) { // IS_DROPABLE はバッファかLOSTイベントかをチェック
+            old_item = rtp_jitter_buffer_pop (priv->jbuf, &percent);
+            GST_DEBUG_OBJECT (jitterbuffer, "Queue full, dropping old packet %p",
+                old_item);
+            priv->next_seqnum = (old_item->seqnum + old_item->count) & 0xffff;
+            free_item (old_item); // free_item でバッファを解放
+          }
+          /* we might have removed some head buffers, signal the pushing thread to
+           * see if it can push now */
+          JBUF_SIGNAL_EVENT (priv);
+        }
+      }
     ```
 
-    `DEFAULT_LATENCY` は通常 200 (ミリ秒) です。
+### `latency` プロパティが処理に与える影響
+
+  * **遅延の増加**: `latency` の値が大きいほど、パイプライン全体の遅延は増加します。これは、パケットをより長くバッファリングするためです。リアルタイム性が重要なアプリケーションでは、この値を適切に設定する必要があります。
+  * **ジッター耐性の向上**: `latency` の値が大きいほど、より大きなネットワークジッターを吸収できます。これにより、ネットワーク状況が不安定な場合でも、スムーズな再生が期待できます。
+  * **パケットロスと品質**:
+      * `latency` が小さい場合、パケットが少し遅れただけでも「欠落」と判断されやすくなり、結果として画質や音質が低下する可能性があります（特に `do-lost` が有効で下流が欠損処理をしない場合）。
+      * `latency` が大きい場合、より多くのパケットの到着を待つため、欠落と判断されるパケットは減りますが、遅延が増加します。
+  * **リソース消費**: バッファリングするパケットが増えるため、`latency` を大きくするとメモリ使用量が増加する可能性があります。
+
+### ソースコードにおける `latency` の設定と使用
+
+  * **プロパティ定義 (`gstrtpjitterbuffer.c`)**:
+    `latency` プロパティは `g_object_class_install_property` を通じて定義され、デフォルト値は `DEFAULT_LATENCY_MS` (200ミリ秒) です。
+
+    ```c
+    /* gstrtpjitterbuffer.c */
+    g_object_class_install_property (gobject_class, PROP_LATENCY,
+        g_param_spec_uint ("latency", "Buffer latency in ms",
+            "Amount of ms to buffer", 0, G_MAXUINT, DEFAULT_LATENCY_MS,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    ```
+
+  * **プロパティ設定時 (`gst_rtp_jitter_buffer_set_property`)**:
+    `latency` プロパティが設定されると、`priv->latency_ms` と `priv->latency_ns` (ナノ秒単位) が更新され、内部の `RTPJitterBuffer` オブジェクトにも `rtp_jitter_buffer_set_delay` を通じてナノ秒単位の遅延時間が設定されます。
+
+    ```c
+    /* gstrtpjitterbuffer.c */
+    static void
+    gst_rtp_jitter_buffer_set_property (GObject * object,
+        guint prop_id, const GValue * value, GParamSpec * pspec)
+    {
+      GstRtpJitterBuffer *jitterbuffer;
+      GstRtpJitterBufferPrivate *priv;
+
+      jitterbuffer = GST_RTP_JITTER_BUFFER (object);
+      priv = jitterbuffer->priv;
+
+      switch (prop_id) {
+        case PROP_LATENCY:
+        {
+          guint new_latency, old_latency;
+
+          new_latency = g_value_get_uint (value);
+
+          JBUF_LOCK (priv); // ジッターバッファのロック
+          old_latency = priv->latency_ms;
+          priv->latency_ms = new_latency;
+          priv->latency_ns = priv->latency_ms * GST_MSECOND; // ミリ秒からナノ秒へ変換
+          rtp_jitter_buffer_set_delay (priv->jbuf, priv->latency_ns); // 内部ジッターバッファへ設定
+          JBUF_UNLOCK (priv); // ロック解除
+
+          /* post message if latency changed, this will inform the parent pipeline
+           * that a latency reconfiguration is possible/needed. */
+          if (new_latency != old_latency) {
+            GST_DEBUG_OBJECT (jitterbuffer, "latency changed to: %" GST_TIME_FORMAT,
+                GST_TIME_ARGS (new_latency * GST_MSECOND));
+
+            gst_element_post_message (GST_ELEMENT_CAST (jitterbuffer),
+                gst_message_new_latency (GST_OBJECT_CAST (jitterbuffer)));
+          }
+          break;
+        }
+        // ... (他のプロパティ処理)
+      }
+    }
+    ```
+
+  * **内部 `RTPJitterBuffer` での遅延設定 (`rtpjitterbuffer.c`)**:
+    `rtp_jitter_buffer_set_delay` 関数は、`jbuf->delay` を設定するとともに、バッファリングモード (`RTP_JITTER_BUFFER_MODE_BUFFER`) で使用される低水位 (`low_level`) および高水位 (`high_level`) の閾値を計算します。これらはバッファの充填率を監視し、バッファリング状態の遷移を制御するために使用されます。
+
+    ```c
+    /* rtpjitterbuffer.c */
+    void
+    rtp_jitter_buffer_set_delay (RTPJitterBuffer * jbuf, GstClockTime delay)
+    {
+      jbuf->delay = delay;
+      jbuf->low_level = (delay * 15) / 100; // 遅延の15%を低水位
+      /* the high level is at 90% in order to release packets before we fill up the
+       * buffer up to the latency */
+      jbuf->high_level = (delay * 90) / 100; // 遅延の90%を高水位
+
+      GST_DEBUG ("delay %" GST_TIME_FORMAT ", min %" GST_TIME_FORMAT ", max %"
+          GST_TIME_FORMAT, GST_TIME_ARGS (jbuf->delay),
+          GST_TIME_ARGS (jbuf->low_level), GST_TIME_ARGS (jbuf->high_level));
+    }
+    ```
+
+  * **タイマー処理での利用**:
+    `latency` は、欠落パケットや期待されるパケットのタイムアウトをスケジュールする際にも間接的に影響します。例えば、`do_deadline_timeout` では、最初のパケットに対するデッドラインタイマーが発火した際に `priv->next_seqnum` を更新し、イベントをシグナルして処理ループを進行させます。このデッドラインは `latency` に基づいて設定された時間後にパケットをプッシュするためのものです。
+    また、`calculate_expected` 関数内では、大きなギャップがある場合に、`total_duration > priv->latency_ns` のような形で `latency` が欠落パケット数の判断に使われます。
+
+`latency` プロパティは、`rtpjitterbuffer` の動作の根幹に関わる重要なパラメータであり、ネットワーク状況やアプリケーションの要件に応じて適切に調整する必要があります。
+
+> rtpjitterbufferにおけるjbuf->delayとjbuf->low_level, jbuf->high_levelの使用箇所とそれぞれの役割を教えてください。
+
+
+`rtpjitterbuffer` エレメントにおける `jbuf->delay`、`jbuf->low_level`、および `jbuf->high_level` は、主に `mode` プロパティが `RTP_JITTER_BUFFER_MODE_BUFFER` (バッファリングモード) に設定されている場合の動作を制御するために、内部の `RTPJitterBuffer` 構造体 (`jbuf`) で使用されます。
+
+これらの値は、`rtpjitterbuffer.c` 内の `rtp_jitter_buffer_set_delay` 関数で、`latency` プロパティの値に基づいて設定されます。
+
+```c
+/* rtpjitterbuffer.c */
+void
+rtp_jitter_buffer_set_delay (RTPJitterBuffer * jbuf, GstClockTime delay)
+{
+  jbuf->delay = delay; // レイテンシプロパティから設定された遅延時間 (ナノ秒)
+  jbuf->low_level = (delay * 15) / 100; // 遅延の15%
+  /* the high level is at 90% in order to release packets before we fill up the
+   * buffer up to the latency */
+  jbuf->high_level = (delay * 90) / 100; // 遅延の90%
+
+  GST_DEBUG ("delay %" GST_TIME_FORMAT ", min %" GST_TIME_FORMAT ", max %"
+      GST_TIME_FORMAT, GST_TIME_ARGS (jbuf->delay),
+      GST_TIME_ARGS (jbuf->low_level), GST_TIME_ARGS (jbuf->high_level));
+}
+```
+
+それぞれの役割と使用箇所は以下の通りです。
+
+### `jbuf->delay`
 
   * **役割**:
 
-      * **ジッター吸収**: ネットワーク経由でRTPパケットを受信する際、各パケットの到着間隔は一定ではなく、揺らぎ（ジッター）が発生します。`latency` プロパティで指定された時間だけパケットをバッファに保持することで、これらの到着時間のばらつきを吸収し、下流のエレメント（デコーダやシンク）にはより均一な間隔でパケットを供給することを目指します。
-      * **再生タイミングの基準**: `rtpjitterbuffer` は、バッファリングされたパケットをすぐには下流に送出せず、`latency` で指定された目標遅延時間と、パケットのRTPタイムスタンプおよびRTCP SRからの同期情報に基づいて計算された「理想的な再生時刻」を考慮して送出タイミングを決定します。
+      * `latency` プロパティによって設定された、ジッターバッファがパケットを保持する目標の最大時間（ナノ秒単位）。
+      * バッファリングモードにおいて、この時間分のデータをバッファリングしようとします。
+      * 他のモード (`RTP_JITTER_BUFFER_MODE_SLAVE` など) でも、PTS 計算時に `pts + jbuf->delay < dts` のような条件で、出力タイムスタンプが入力DTSに対して早すぎる場合にリセットを行う判断基準の一部として参照されることがあります (下記 `rtp_jitter_buffer_calculate_pts` 内のコード断片を参照)。
 
-### `latency` プロパティ設定時の内部処理
+  * **主な使用箇所**:
 
-`latency` プロパティが設定されると、`gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_set_property()` 関数が呼び出されます。
-
-```c
-// gstrtpjitterbuffer.c
-static void
-gst_rtp_jitter_buffer_set_property (GObject * object, guint prop_id,
-    const GValue * value, GParamSpec * pspec)
-{
-  GstRtpJitterBuffer *jbuf = GST_RTP_JITTER_BUFFER (object);
-  GstRtpJitterBufferPrivate *priv = jbuf->priv;
-
-  GST_OBJECT_LOCK (jbuf); // エレメントのロック
-
-  switch (prop_id) {
-    // ... (他のプロパティの処理) ...
-    case PROP_LATENCY:
-      priv->latency = g_value_get_uint (value); // GstRtpJitterBuffer のプライベート構造体に値を保存
-      if (priv->jbuf) // コアの RTPJitterBuffer インスタンスが存在すれば
-        rtp_jitter_buffer_set_latency (priv->jbuf, priv->latency); // コアライブラリの関数を呼び出し
-      GST_DEBUG_OBJECT (jbuf, "latency set to %u ms", priv->latency);
-      break;
-    // ... (他のプロパティの処理) ...
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
-      break;
-  }
-  GST_OBJECT_UNLOCK (jbuf);
-}
-```
-
-このコードからわかるように、`latency` プロパティの値は `GstRtpJitterBuffer` のプライベート構造体 `priv->latency` に保存され、さらにコアのジッターバッファライブラリのインスタンス `priv->jbuf` に対して `rtp_jitter_buffer_set_latency()` 関数を呼び出して設定されます。
-
-`rtpjitterbuffer.c` の `rtp_jitter_buffer_set_latency()` 関数は、受け取った値を内部の `RTPJitterBuffer` 構造体の `latency` フィールドに格納します。
-
-```c
-// rtpjitterbuffer.c
-void
-rtp_jitter_buffer_set_latency (RTPJitterBuffer * jbuf, guint latency)
-{
-  g_return_if_fail (RTP_IS_JITTER_BUFFER (jbuf));
-
-  JBUF_LOCK (jbuf); // RTPJitterBuffer 内部のロック
-  jbuf->latency = latency;
-  JBUF_UNLOCK (jbuf);
-}
-```
-
-この `jbuf->latency` の値は、後述するパケット送出ロジックで重要な役割を果たします。
-
-### `latency` の値が処理に与える影響
-
-`latency` の設定値は、主にパケットの送出タイミング決定ロジック (`rtpjitterbuffer.c` の `rtp_jitter_buffer_get_packet_internal()` や、それを呼び出す `rtp_jitter_buffer_get_packet()`) に影響を与えます。
-
-1.  **バッファリングの深さ**:
-
-      * `latency` の値が大きいほど、ジッターバッファはより多くのパケットを内部に保持しようとします（時間的に）。これにより、より大きなネットワークジッターや、一時的なパケット順序の入れ替わりを吸収できる可能性が高まります。
-      * 結果として、再生が途切れたりカクついたりする可能性が低減されます。
-
-2.  **再生開始までの遅延**:
-
-      * `latency` の値が大きいほど、最初のパケットを受信してから実際に再生が開始されるまでの遅延（初期遅延）が大きくなる傾向があります。これは、エレメントが `latency` 分のデータをバッファしようとするためです。
-      * ただし、`faststart-min-packets` プロパティが設定されている場合、指定された数の連続したパケットが到着すれば、`latency` に達していなくても再生を開始することがあります。
-
-3.  **リアルタイム性**:
-
-      * `latency` の値が大きいほど、エンドツーエンドの遅延（送信者がメディアを送信してから受信者がそれを再生するまでの時間）が増加します。これは、インタラクティブなアプリケーション（ビデオ会議など）では問題となる可能性があります。
-      * 逆に `latency` の値を小さくすると、遅延は減少しますが、ジッター吸収能力が低下し、ネットワーク状態が悪い場合には再生品質が低下しやすくなります。
-
-4.  **パケットの送出タイミング (`rtp_jitter_buffer_get_packet_internal`)**:
-
-      * この関数は、次に出力すべきパケットとその理想的なリリース時刻 (`next_release_time`) を決定します。
-      * `mode` が `GST_RTP_JITTER_BUFFER_MODE_SLAVE` の場合、`next_release_time` は主にパケットのRTPタイムスタンプ、RTCP SRからの同期情報 (`base_time`, `base_extrtp`, `skew`, `clock_rate`)、そしてこの `latency` を考慮して計算されます。
-      * 具体的には、バッファ内の最初のパケットの理想的な再生時刻を計算し、その時刻に `latency` を加味した時刻を、パケットを保持すべき目標時刻とします。
+      * **`rtp_jitter_buffer_set_delay` (`rtpjitterbuffer.c`)**: `latency` プロパティから値が設定され、`low_level` と `high_level` もこの値に基づいて計算されます。
+      * **`rtp_jitter_buffer_calculate_pts` (`rtpjitterbuffer.c`)**:
         ```c
-        // rtpjitterbuffer.c の rtp_jitter_buffer_get_packet_internal() 内のロジックの一部 (概念)
-        // 理想的な最初のパケットのリリース時刻 ideal_release_time を計算
-        // ...
-        // ターゲットリリース時刻 target_time = ideal_release_time + GST_MSECOND * jbuf->latency;
-        // ...
-        // 現在時刻が target_time に達していなければ、まだパケットを出さない (待つ)
-        // ただし、バッファが空になりそうな場合や、max_dropout_time を超えた場合は別
+        /* rtpjitterbuffer.c */
+        if (dts != -1 && pts + jbuf->delay < dts) {
+          /* if we are going to produce a timestamp that is later than the input
+           * timestamp, we need to reset the jitterbuffer. Likely the server paused
+           * temporarily */
+          GST_DEBUG ("out %" GST_TIME_FORMAT " + %" G_GUINT64_FORMAT " < time %"
+              GST_TIME_FORMAT ", reset jitterbuffer", GST_TIME_ARGS (pts),
+              jbuf->delay, GST_TIME_ARGS (dts));
+          rtp_jitter_buffer_resync (jbuf, dts, gstrtptime, ext_rtptime, TRUE);
+          pts = dts;
+        }
         ```
-      * `mode` が `GST_RTP_JITTER_BUFFER_MODE_BUFFER` の場合は、より単純に `latency` 時間分のバッファを維持しようとします。
+        ここでは、計算された出力PTS (`pts`) に `jbuf->delay` を加えた値が、入力DTS (`dts`) よりも小さい場合 (つまり、バッファリングを考慮しても出力が早すぎる場合) に、タイムスタンプの再同期を行うかどうかを判断しています。
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_src_event` 内で、下流からの `GST_EVENT_LATENCY` を処理する際に、バッファリングモードであれば `rtp_jitter_buffer_set_delay` を呼び出して内部の `jbuf->delay` を更新する可能性があります。
 
-5.  **`drop-on-latency` プロパティとの連携**:
+### `jbuf->low_level` (低水位マーク)
 
-      * `drop-on-latency` が `TRUE` の場合、あるパケットの理想的な再生時刻に `latency` を加えた時刻よりも、現在のパイプラインクロック時刻がさらに進んでしまっている（つまり、そのパケットは「遅すぎる」）と判断されると、そのパケットはドロップされます。
-      * `drop-on-latency` が `FALSE` (デフォルト) の場合は、遅れて到着したパケットも可能な限り再生しようとしますが、これにより全体の遅延が増加する可能性があります。
+  * **役割**:
 
-### `latency` 設定値の選択ガイドライン
+      * バッファリングモード (`RTP_JITTER_BUFFER_MODE_BUFFER`) において、ジッターバッファ内のデータ量がこの値を下回った場合に、再度バッファリングを開始するための閾値です。
+      * 通常、`jbuf->delay` の 15% に設定されます。
+      * これにより、ネットワーク状態が一時的に改善してバッファが消費された後、再びジッターが増加した場合に備えてバッファを再充填します。
 
-適切な `latency` の値は、ネットワーク環境とアプリケーションの要件によって異なります。
+  * **主な使用箇所**:
 
-  * **ネットワーク状態が良い (ジッターが小さい) 場合**:
-      * `latency` を比較的小さな値（例: 数十ミリ秒）に設定しても、スムーズな再生が期待できます。これにより、リアルタイム性が向上します。
-  * **ネットワーク状態が悪い (ジッターが大きい) 場合**:
-      * `latency` を大きな値（例: 200ミリ秒以上）に設定することで、ジッター吸収能力を高め、再生の途切れを防ぐことができます。ただし、遅延は増加します。
-  * **インタラクティブなアプリケーション (例: ビデオ会議、オンラインゲーム)**:
-      * 遅延を最小限に抑えることが重要なので、許容できる範囲で `latency` を小さく設定する必要があります。ネットワーク品質の確保がより重要になります。
-  * **ストリーミング再生 (例: オンデマンドビデオ、IPTV)**:
-      * 多少の初期遅延は許容できる場合が多いので、安定した再生のために `latency` を比較的高めに設定することが一般的です。
+      * **`rtp_jitter_buffer_set_delay` (`rtpjitterbuffer.c`)**: `jbuf->delay` に基づいて計算・設定されます。
+      * **`update_buffer_level` (`rtpjitterbuffer.c`)**:
+        ```c
+        /* rtpjitterbuffer.c */
+        static void
+        update_buffer_level (RTPJitterBuffer * jbuf, gint * percent)
+        {
+          // ... (level の計算) ...
 
-GStreamer のドキュメントや `rtpjitterbuffer` のデフォルト値 (200ms) は、多くの一般的なユースケースで妥当な出発点となりますが、実際の環境でテストし、最適な値を見つけることが推奨されます。`gst-launch-1.0` の `-v` オプションや、`GST_DEBUG="rtpjitterbuffer:5"` のようなデバッグ出力を有効にすることで、ジッターバッファの動作状況（バッファリングレベル、ドロップされたパケットなど）を確認しながら調整することができます。
+          if (jbuf->buffering) { // 現在バッファリング中の場合
+            post = TRUE;
+            if (level >= jbuf->high_level) { // バッファレベルが高水位マーク以上に達したら
+              GST_DEBUG ("buffering finished");
+              jbuf->buffering = FALSE; // バッファリングを終了
+            }
+          } else { // 現在バッファリング中でない場合
+            if (level < jbuf->low_level) { // バッファレベルが低水位マーク未満になったら
+              GST_DEBUG ("buffering started");
+              jbuf->buffering = TRUE; // バッファリングを開始
+              post = TRUE;
+            }
+          }
+          // ... (percent の計算と GstMessage の処理) ...
+        }
+        ```
+        この関数は、バッファ内のデータ量 (`level`) を監視し、`level` が `jbuf->low_level` を下回ると、`jbuf->buffering` フラグを `TRUE` に設定してバッファリング状態に移行します。
 
-また、`rtpjitterbuffer` は `num-lost` や `avg-jitter` などの統計情報をGStreamerメッセージとしてバスにポストすることがあるため、アプリケーション側でこれらの情報を監視し、動的に `latency` を調整するような高度な制御も可能です（ただし、そのような動的調整ロジックはアプリケーション側で実装する必要があります）。
+### `jbuf->high_level` (高水位マーク)
 
-> ジッターの計算式とlatencyプロパティの関係を教えてください
+  * **役割**:
 
-`rtpjitterbuffer` エレメントにおける「ジッター」の計算式そのものは、ソースコード内に特定の「この式でジッター値を算出しています」という形で明示されているわけではありません。`rtpjitterbuffer` は、ジッターそのものを数値として計算し続けるというよりは、**ジッターによって発生する現象（パケット到着時刻の揺らぎ、順序の入れ替わり）を吸収・緩和する**ことを目的として動作します。
+      * バッファリングモード (`RTP_JITTER_BUFFER_MODE_BUFFER`) において、ジッターバッファ内のデータ量がこの値に達した場合に、バッファリングを完了したとみなし、パケットの出力を開始 (または再開) するための閾値です。
+      * 通常、`jbuf->delay` の 90% に設定されます。90% に設定されているのは、`latency` で指定された時間ちょうどまで待つのではなく、少し手前で出力を開始することで、バッファが完全に一杯になる前にスムーズな再生を開始するためです。
 
-しかし、RFC 3550 (RTP: A Transport Protocol for Real-Time Applications) で定義されている**RTCP Receiver Report (RR) で報告されるジッター値の計算方法**が、間接的に `rtpjitterbuffer` の動作や、QoS (Quality of Service) メッセージの生成、統計情報の提供などに関連してきます。
+  * **主な使用箇所**:
 
-そして、`latency` プロパティは、このジッターをどれだけ許容し、吸収するためのバッファリング時間（遅延）を設けるか、という点で深く関わってきます。
+      * **`rtp_jitter_buffer_set_delay` (`rtpjitterbuffer.c`)**: `jbuf->delay` に基づいて計算・設定されます。
+      * **`update_buffer_level` (`rtpjitterbuffer.c`)**: 上記の `update_buffer_level` 関数のコード断片に示されるように、バッファ内のデータ量 (`level`) が `jbuf->high_level` に達すると、`jbuf->buffering` フラグを `FALSE` に設定してバッファリング状態を解除し、パケットの供給を開始します。
+      * **`rtp_jitter_buffer_get_percent` (`rtpjitterbuffer.c`)**: バッファの使用率を計算する際に、`jbuf->high_level` を分母として使用します。
 
-### RFC 3550 におけるジッター計算
+これらの値は、特に `rtpjitterbuffer` が `mode=buffer` (GEnumValue `RTP_JITTER_BUFFER_MODE_BUFFER`) で動作している場合に、動的なバッファリング制御の中心的な役割を果たします。ネットワークの状況に応じてバッファリングを開始したり停止したりすることで、遅延を最小限に抑えつつ、再生の途切れを防ぐことを目指します。他のモード (例: `slave` モード) では、これらの水位マークに基づくバッファリング制御はアクティブにはならず、主に `jbuf->delay` がタイムアウトや PTS 計算の基準として参照されます。
 
-RFC 3550 (Section 6.4.1) では、受信側が計算するジッター値について以下のように定義されています。これは、連続するパケット間の到着時刻の差の統計的な分散（具体的には平均偏差）を表します。
+> rtpjitterbufferにおけるlatencyプロパティの機能と処理に与える影響についてソースコードを例示しながら解説してください。
 
-1.  あるパケット `i` がRTPタイムスタンプ $R\_i$ で送信され、受信時刻 $S\_i$ (ローカルクロック時間) で到着したとします。
+`rtpjitterbuffer` エレメントの `latency` プロパティは、ネットワークジッターを吸収するために RTP パケットをバッファリングする最大時間をミリ秒単位で指定します。この値は、エレメントがパケットをどれくらいの期間保持し、順序の入れ替えや欠落パケットの到着待ちを行うかを決定する上で非常に重要です。
 
-2.  同様に、その直前のパケット `i-1` はRTPタイムスタンプ $R\_{i-1}$ で送信され、受信時刻 $S\_{i-1}$ で到着したとします。
+デフォルト値は `200` ミリ秒です。
 
-3.  パケット間の伝送時間差 $D(i-1, i)$ は以下のように計算されます。
-    $D(i-1, i) = (S\_i - S\_{i-1}) - (R\_i - R\_{i-1})$
+### `latency` プロパティの機能
 
-      * $(S\_i - S\_{i-1})$: パケット $i-1$ と $i$ の受信時刻の間隔。
-      * $(R\_i - R\_{i-1})$: パケット $i-1$ と $i$ の送信時刻の間隔（RTPタイムスタンプの差をクロックレートで割って秒単位に換算したもの）。
-      * 理想的なネットワークでは、$D(i-1, i)$ は常に0に近いはずです。これが大きく変動するのがジッターです。
+1.  **ジッター吸収**: ネットワーク遅延の変動（ジッター）により、パケットの到着間隔が一定でなくなることがあります。`latency` プロパティで設定された時間だけパケットを内部バッファに保持することで、これらの到着時間の揺らぎを平滑化し、より安定したメディアストリームを下流に供給します。
 
-4.  この $D$ の値を使って、受信ジッター $J\_i$ は以下の平滑化アルゴリズム（EWMA: Exponentially Weighted Moving Average）で更新されます。
-    $J\_i = J\_{i-1} + (|D(i-1, i)| - J\_{i-1}) / 16$
-    または、整数演算で書くと:
-    $J\_i = J\_{i-1} + ((|D(i-1, i)| \<\< 4) - J\_{i-1} + 8) \>\> 4$
+2.  **パケット並べ替えのための待機時間**: RTP パケットはネットワークの状況により順序通りに到着しないことがあります。`latency` は、後続のパケットが到着するのを待つ時間の上限となり、この時間内に到着したパケットはシーケンス番号に基づいて並べ替えられます。
 
-この計算されたジッター値 $J\_i$ (RTPタイムスタンプ単位) は、RTCP RRブロックの `interarrival jitter` フィールドに設定されて送信者に報告されます。
+3.  **欠落パケットの判断基準**:
 
-### `rtpjitterbuffer` とジッター計算・`latency` の関係
+      * `do-lost` プロパティが `TRUE` の場合、パケットが `latency` で設定された時間内に到着しないと「欠落した」と判断されます。
+      * この場合、`GstRTPPacketLost` という名前のカスタムイベントが下流に送信されます。
 
-`rtpjitterbuffer` のソースコード (`rtpjitterbuffer.c`) を見ると、`rtp_jitter_buffer_add_item()` 関数内で、新しく到着したパケットの情報を元に、まさに上記RFC 3550の定義に近い形でジッター計算の準備が行われている部分があります。
+4.  **再送要求のタイムアウト基準 (間接的)**:
+
+      * `do-retransmission` プロパティが `TRUE` の場合、`latency` は再送要求 (`rtx-retry-period`) の期間を決定する際の要素の一つとなり得ます。具体的には、`rtx-retry-period` が自動設定 (-1) の場合、`latency` と観測されたラウンドトリップタイムに基づいて再送を試みる期間が推定されます。
+
+5.  **バッファ管理 (`drop-on-latency`)**:
+
+      * `drop-on-latency` プロパティが `TRUE` の場合、ジッターバッファ内のデータ量が `latency` で指定された時間分を超過しないように、最も古いパケットから破棄します。
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_chain` 関数内で、`drop-on-latency` が有効で、かつ内部バッファ (`priv->jbuf`) の保持期間 (`rtp_jitter_buffer_get_ts_diff`) が設定された `latency_ns` を超えた場合に、古いアイテムをドロップする処理があります。
+
+    <!-- end list -->
+
+    ```c
+    /* gstrtpjitterbuffer.c */
+    if (priv->latency_ms && priv->drop_on_latency) {
+        latency_ts =
+            gst_util_uint64_scale_int (priv->latency_ms, priv->clock_rate, 1000);
+
+        if (G_UNLIKELY (rtp_jitter_buffer_get_ts_diff (priv->jbuf) >= latency_ts)) {
+          RTPJitterBufferItem *old_item;
+
+          old_item = rtp_jitter_buffer_peek (priv->jbuf);
+
+          if (IS_DROPABLE (old_item)) { // IS_DROPABLE はバッファかLOSTイベントかをチェック
+            old_item = rtp_jitter_buffer_pop (priv->jbuf, &percent);
+            GST_DEBUG_OBJECT (jitterbuffer, "Queue full, dropping old packet %p",
+                old_item);
+            priv->next_seqnum = (old_item->seqnum + old_item->count) & 0xffff;
+            free_item (old_item); // free_item でバッファを解放
+          }
+          /* we might have removed some head buffers, signal the pushing thread to
+           * see if it can push now */
+          JBUF_SIGNAL_EVENT (priv);
+        }
+      }
+    ```
+
+### `latency` プロパティが処理に与える影響
+
+  * **遅延の増加**: `latency` の値が大きいほど、パイプライン全体の遅延は増加します。これは、パケットをより長くバッファリングするためです。リアルタイム性が重要なアプリケーションでは、この値を適切に設定する必要があります。
+  * **ジッター耐性の向上**: `latency` の値が大きいほど、より大きなネットワークジッターを吸収できます。これにより、ネットワーク状況が不安定な場合でも、スムーズな再生が期待できます。
+  * **パケットロスと品質**:
+      * `latency` が小さい場合、パケットが少し遅れただけでも「欠落」と判断されやすくなり、結果として画質や音質が低下する可能性があります（特に `do-lost` が有効で下流が欠損処理をしない場合）。
+      * `latency` が大きい場合、より多くのパケットの到着を待つため、欠落と判断されるパケットは減りますが、遅延が増加します。
+  * **リソース消費**: バッファリングするパケットが増えるため、`latency` を大きくするとメモリ使用量が増加する可能性があります。
+
+### ソースコードにおける `latency` の設定と使用
+
+  * **プロパティ定義 (`gstrtpjitterbuffer.c`)**:
+    `latency` プロパティは `g_object_class_install_property` を通じて定義され、デフォルト値は `DEFAULT_LATENCY_MS` (200ミリ秒) です。
+
+    ```c
+    /* gstrtpjitterbuffer.c */
+    g_object_class_install_property (gobject_class, PROP_LATENCY,
+        g_param_spec_uint ("latency", "Buffer latency in ms",
+            "Amount of ms to buffer", 0, G_MAXUINT, DEFAULT_LATENCY_MS,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+    ```
+
+  * **プロパティ設定時 (`gst_rtp_jitter_buffer_set_property`)**:
+    `latency` プロパティが設定されると、`priv->latency_ms` と `priv->latency_ns` (ナノ秒単位) が更新され、内部の `RTPJitterBuffer` オブジェクトにも `rtp_jitter_buffer_set_delay` を通じてナノ秒単位の遅延時間が設定されます。
+
+    ```c
+    /* gstrtpjitterbuffer.c */
+    static void
+    gst_rtp_jitter_buffer_set_property (GObject * object,
+        guint prop_id, const GValue * value, GParamSpec * pspec)
+    {
+      GstRtpJitterBuffer *jitterbuffer;
+      GstRtpJitterBufferPrivate *priv;
+
+      jitterbuffer = GST_RTP_JITTER_BUFFER (object);
+      priv = jitterbuffer->priv;
+
+      switch (prop_id) {
+        case PROP_LATENCY:
+        {
+          guint new_latency, old_latency;
+
+          new_latency = g_value_get_uint (value);
+
+          JBUF_LOCK (priv); // ジッターバッファのロック
+          old_latency = priv->latency_ms;
+          priv->latency_ms = new_latency;
+          priv->latency_ns = priv->latency_ms * GST_MSECOND; // ミリ秒からナノ秒へ変換
+          rtp_jitter_buffer_set_delay (priv->jbuf, priv->latency_ns); // 内部ジッターバッファへ設定
+          JBUF_UNLOCK (priv); // ロック解除
+
+          /* post message if latency changed, this will inform the parent pipeline
+           * that a latency reconfiguration is possible/needed. */
+          if (new_latency != old_latency) {
+            GST_DEBUG_OBJECT (jitterbuffer, "latency changed to: %" GST_TIME_FORMAT,
+                GST_TIME_ARGS (new_latency * GST_MSECOND));
+
+            gst_element_post_message (GST_ELEMENT_CAST (jitterbuffer),
+                gst_message_new_latency (GST_OBJECT_CAST (jitterbuffer)));
+          }
+          break;
+        }
+        // ... (他のプロパティ処理)
+      }
+    }
+    ```
+
+  * **内部 `RTPJitterBuffer` での遅延設定 (`rtpjitterbuffer.c`)**:
+    `rtp_jitter_buffer_set_delay` 関数は、`jbuf->delay` を設定するとともに、バッファリングモード (`RTP_JITTER_BUFFER_MODE_BUFFER`) で使用される低水位 (`low_level`) および高水位 (`high_level`) の閾値を計算します。これらはバッファの充填率を監視し、バッファリング状態の遷移を制御するために使用されます。
+
+    ```c
+    /* rtpjitterbuffer.c */
+    void
+    rtp_jitter_buffer_set_delay (RTPJitterBuffer * jbuf, GstClockTime delay)
+    {
+      jbuf->delay = delay;
+      jbuf->low_level = (delay * 15) / 100; // 遅延の15%を低水位
+      /* the high level is at 90% in order to release packets before we fill up the
+       * buffer up to the latency */
+      jbuf->high_level = (delay * 90) / 100; // 遅延の90%を高水位
+
+      GST_DEBUG ("delay %" GST_TIME_FORMAT ", min %" GST_TIME_FORMAT ", max %"
+          GST_TIME_FORMAT, GST_TIME_ARGS (jbuf->delay),
+          GST_TIME_ARGS (jbuf->low_level), GST_TIME_ARGS (jbuf->high_level));
+    }
+    ```
+
+  * **タイマー処理での利用**:
+    `latency` は、欠落パケットや期待されるパケットのタイムアウトをスケジュールする際にも間接的に影響します。例えば、`do_deadline_timeout` では、最初のパケットに対するデッドラインタイマーが発火した際に `priv->next_seqnum` を更新し、イベントをシグナルして処理ループを進行させます。このデッドラインは `latency` に基づいて設定された時間後にパケットをプッシュするためのものです。
+    また、`calculate_expected` 関数内では、大きなギャップがある場合に、`total_duration > priv->latency_ns` のような形で `latency` が欠落パケット数の判断に使われます。
+
+`latency` プロパティは、`rtpjitterbuffer` の動作の根幹に関わる重要なパラメータであり、ネットワーク状況やアプリケーションの要件に応じて適切に調整する必要があります。
+
+
+> rtpjitterbufferにおけるjbuf->delayとjbuf->low_level, jbuf->high_levelの使用箇所とそれぞれの役割を教えてください。
+
+`rtpjitterbuffer` エレメントにおける `jbuf->delay`、`jbuf->low_level`、および `jbuf->high_level` は、主に `mode` プロパティが `RTP_JITTER_BUFFER_MODE_BUFFER` (バッファリングモード) に設定されている場合の動作を制御するために、内部の `RTPJitterBuffer` 構造体 (`jbuf`) で使用されます。
+
+これらの値は、`rtpjitterbuffer.c` 内の `rtp_jitter_buffer_set_delay` 関数で、`latency` プロパティの値に基づいて設定されます。
 
 ```c
-// rtpjitterbuffer.c の rtp_jitter_buffer_add_item 関数内の一部 (簡略化)
-static RTPJitterBufferItem *
-rtp_jitter_buffer_add_item (RTPJitterBuffer * jbuf, RTPJitterBufferItem * item)
+/* rtpjitterbuffer.c */
+void
+rtp_jitter_buffer_set_delay (RTPJitterBuffer * jbuf, GstClockTime delay)
 {
-  // ... (他の処理) ...
+  jbuf->delay = delay; // レイテンシプロパティから設定された遅延時間 (ナノ秒)
+  jbuf->low_level = (delay * 15) / 100; // 遅延の15%
+  /* the high level is at 90% in order to release packets before we fill up the
+   * buffer up to the latency */
+  jbuf->high_level = (delay * 90) / 100; // 遅延の90%
 
-  // ジッター計算のための情報更新
-  if (GST_CLOCK_TIME_IS_VALID (jbuf->last_arrival) &&
-      GST_CLOCK_TIME_IS_VALID (item->arrival) &&
-      jbuf->clock_rate != 0 && jbuf->received_any) {
-    GstClockTime transit_diff;
-    GstClockTime arrival_diff, rtp_time_diff;
-    guint32 jitter;
-
-    arrival_diff = item->arrival - jbuf->last_arrival;
-    rtp_time_diff =
-        (item->ext_rtptime -
-        jbuf->last_rtptime) * (GstClockTime) GST_SECOND / jbuf->clock_rate;
-
-    if (rtp_time_diff > arrival_diff)
-      transit_diff = rtp_time_diff - arrival_diff;
-    else
-      transit_diff = arrival_diff - rtp_time_diff;
-
-    // RFC3550のジッター計算 (D(i-1, i) に相当する部分)
-    // D = (S_i - S_{i-1}) - (R_i - R_{i-1})
-    // ここでは transit_diff が |D| に近い値 (絶対値を取る前の差の絶対値)
-    // jbuf->jitter はRTPタイムスタンプ単位
-    jitter = jbuf->jitter;
-    jitter += (guint32) ((transit_diff * jbuf->clock_rate / GST_SECOND) -
-        jitter + 8) / 16; // EWMA の更新
-    jbuf->jitter = jitter;
-
-    GST_LOG_OBJECT (jbuf,
-        "arrival %" GST_TIME_FORMAT " (+%" G_GINT64_FORMAT "), rtp %"
-        G_GUINT64_FORMAT " (+%" G_GINT64_FORMAT "), jitter %u",
-        GST_TIME_ARGS (item->arrival),
-        GST_CLOCK_DIFF_ARGS (arrival_diff), item->ext_rtptime,
-        item->ext_rtptime - jbuf->last_rtptime, jbuf->jitter);
-  }
-  jbuf->last_arrival = item->arrival;
-  jbuf->last_rtptime = item->ext_rtptime;
-  jbuf->received_any = TRUE;
-
-  // ... (パケットをリストに追加する処理など) ...
-
-  return item;
+  GST_DEBUG ("delay %" GST_TIME_FORMAT ", min %" GST_TIME_FORMAT ", max %"
+      GST_TIME_FORMAT, GST_TIME_ARGS (jbuf->delay),
+      GST_TIME_ARGS (jbuf->low_level), GST_TIME_ARGS (jbuf->high_level));
 }
 ```
 
-このコードでは、連続するパケットの到着時刻の差 (`arrival_diff`) とRTPタイムスタンプの差 (`rtp_time_diff`) を比較し、その差の絶対値 (`transit_diff`) を使って `jbuf->jitter` を更新しています。この `jbuf->jitter` がRTCP RRで報告されるジッター値の基になります。
+それぞれの役割と使用箇所は以下の通りです。
 
-**`latency` プロパティとの関係性**:
+### `jbuf->delay`
 
-1.  **ジッターの許容量**: `latency` プロパティは、「これくらいの時間分のジッター（到着時刻の揺らぎ）までは吸収できるようにバッファリングする」という目標値をエレメントに与えます。つまり、**`latency` はジッターそのものを計算する式には直接現れませんが、計算されたジッターや観測される到着時間の揺らぎに対して、システムがどれだけ耐性を持つかを決定するパラメータ**です。
+  * **役割**:
 
-2.  **バッファリング判断への影響**:
+      * `latency` プロパティによって設定された、ジッターバッファがパケットを保持する目標の最大時間（ナノ秒単位）。
+      * バッファリングモードにおいて、この時間分のデータをバッファリングしようとします。
+      * 他のモード (`RTP_JITTER_BUFFER_MODE_SLAVE` など) でも、PTS 計算時に `pts + jbuf->delay < dts` のような条件で、出力タイムスタンプが入力DTSに対して早すぎる場合にリセットを行う判断基準の一部として参照されることがあります (下記 `rtp_jitter_buffer_calculate_pts` 内のコード断片を参照)。
 
-      * `rtpjitterbuffer` は、`latency` で指定された時間分のデータを保持しようとします。
-      * ネットワークのジッターが大きい場合、パケットの到着間隔は大きく変動します。`latency` が十分に大きければ、遅れて到着したパケットもバッファ内に保持され、再生順序が来たときに下流に渡されるため、再生が途切れるのを防ぐことができます。
-      * `latency` が小さい場合、大きなジッターによって遅れたパケットは、すでに再生されるべき時刻を過ぎていると判断され、ドロップされるか（`drop-on-latency = TRUE` の場合）、あるいは後から再生されて全体の遅延を増加させる可能性があります。
+  * **主な使用箇所**:
 
-3.  **再生開始タイミング**:
+      * **`rtp_jitter_buffer_set_delay` (`rtpjitterbuffer.c`)**: `latency` プロパティから値が設定され、`low_level` と `high_level` もこの値に基づいて計算されます。
+      * **`rtp_jitter_buffer_calculate_pts` (`rtpjitterbuffer.c`)**:
+        ```c
+        /* rtpjitterbuffer.c */
+        if (dts != -1 && pts + jbuf->delay < dts) {
+          /* if we are going to produce a timestamp that is later than the input
+           * timestamp, we need to reset the jitterbuffer. Likely the server paused
+           * temporarily */
+          GST_DEBUG ("out %" GST_TIME_FORMAT " + %" G_GUINT64_FORMAT " < time %"
+              GST_TIME_FORMAT ", reset jitterbuffer", GST_TIME_ARGS (pts),
+              jbuf->delay, GST_TIME_ARGS (dts));
+          rtp_jitter_buffer_resync (jbuf, dts, gstrtptime, ext_rtptime, TRUE);
+          pts = dts;
+        }
+        ```
+        ここでは、計算された出力PTS (`pts`) に `jbuf->delay` を加えた値が、入力DTS (`dts`) よりも小さい場合 (つまり、バッファリングを考慮しても出力が早すぎる場合) に、タイムスタンプの再同期を行うかどうかを判断しています。
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_src_event` 内で、下流からの `GST_EVENT_LATENCY` を処理する際に、バッファリングモードであれば `rtp_jitter_buffer_set_delay` を呼び出して内部の `jbuf->delay` を更新する可能性があります。
 
-      * `rtpjitterbuffer` は、バッファ内のパケットのRTPタイムスタンプとRTCP SRからの同期情報（`base_time`, `base_extrtp`, `skew`, `clock_rate`）を使って、各パケットが再生されるべき理想的な時刻を計算します。
-      * `latency` の値は、この理想的な再生時刻に対して、さらにどれだけ追加で遅延（バッファリング）を許容するかというオフセットとして機能します。
-      * `rtp_jitter_buffer_get_packet_internal()` 内で、バッファからパケットを取り出すかどうかを判断する際に、この `latency` が考慮されます。具体的には、バッファの先頭パケットの理想的な再生時刻に `latency` を加算した時刻 (`target_time`) を計算し、現在のパイプラインクロック時刻がこの `target_time` に達するまでパケットの送出を待つ、というようなロジックが含まれています。
+### `jbuf->low_level` (低水位マーク)
 
-4.  **QoSメッセージ**:
+  * **役割**:
 
-      * `rtpjitterbuffer` は、観測されたジッターやバッファリング状態（アンダーフローやオーバーフローの可能性）に基づいて、QoSメッセージをGStreamerのバスにポストすることがあります。
-      * このQoSメッセージには、現在のジッターレベルやバッファ占有率などの情報が含まれることがあり、アプリケーションはこれを利用してネットワーク状態を把握したり、`latency` プロパティを動的に調整したりすることができます。
+      * バッファリングモード (`RTP_JITTER_BUFFER_MODE_BUFFER`) において、ジッターバッファ内のデータ量がこの値を下回った場合に、再度バッファリングを開始するための閾値です。
+      * 通常、`jbuf->delay` の 15% に設定されます。
+      * これにより、ネットワーク状態が一時的に改善してバッファが消費された後、再びジッターが増加した場合に備えてバッファを再充填します。
 
-**まとめると**:
+  * **主な使用箇所**:
 
-  * `rtpjitterbuffer` は内部的にRFC 3550に準拠した方法でパケット到着間隔の変動（ジッターの指標となる値）を追跡・計算しています。この計算されたジッター値は主にRTCP RRでの報告に使われます。
-  * `latency` プロパティは、この観測されるジッターに対して、エレメントがどれだけのバッファリング時間（遅延）を設けて対応するかの目標値を設定します。
-  * `latency` が大きいほど、大きなジッターを吸収してスムーズな再生を維持しやすくなりますが、全体の遅延は増加します。
-  * `latency` が小さいほど、遅延は減りますが、ジッターに対する耐性が低下し、再生が不安定になる可能性があります。
+      * **`rtp_jitter_buffer_set_delay` (`rtpjitterbuffer.c`)**: `jbuf->delay` に基づいて計算・設定されます。
+      * **`update_buffer_level` (`rtpjitterbuffer.c`)**:
+        ```c
+        /* rtpjitterbuffer.c */
+        static void
+        update_buffer_level (RTPJitterBuffer * jbuf, gint * percent)
+        {
+          // ... (level の計算) ...
 
-したがって、`latency` はジッターの「計算式」に直接組み込まれるのではなく、ジッターという現象に対してエレメントがどのように振る舞うか（どれだけバッファして吸収するか）を制御するための重要なパラメータとなります。
+          if (jbuf->buffering) { // 現在バッファリング中の場合
+            post = TRUE;
+            if (level >= jbuf->high_level) { // バッファレベルが高水位マーク以上に達したら
+              GST_DEBUG ("buffering finished");
+              jbuf->buffering = FALSE; // バッファリングを終了
+            }
+          } else { // 現在バッファリング中でない場合
+            if (level < jbuf->low_level) { // バッファレベルが低水位マーク未満になったら
+              GST_DEBUG ("buffering started");
+              jbuf->buffering = TRUE; // バッファリングを開始
+              post = TRUE;
+            }
+          }
+          // ... (percent の計算と GstMessage の処理) ...
+        }
+        ```
+        この関数は、バッファ内のデータ量 (`level`) を監視し、`level` が `jbuf->low_level` を下回ると、`jbuf->buffering` フラグを `TRUE` に設定してバッファリング状態に移行します。
+
+### `jbuf->high_level` (高水位マーク)
+
+  * **役割**:
+
+      * バッファリングモード (`RTP_JITTER_BUFFER_MODE_BUFFER`) において、ジッターバッファ内のデータ量がこの値に達した場合に、バッファリングを完了したとみなし、パケットの出力を開始 (または再開) するための閾値です。
+      * 通常、`jbuf->delay` の 90% に設定されます。90% に設定されているのは、`latency` で指定された時間ちょうどまで待つのではなく、少し手前で出力を開始することで、バッファが完全に一杯になる前にスムーズな再生を開始するためです。
+
+  * **主な使用箇所**:
+
+      * **`rtp_jitter_buffer_set_delay` (`rtpjitterbuffer.c`)**: `jbuf->delay` に基づいて計算・設定されます。
+      * **`update_buffer_level` (`rtpjitterbuffer.c`)**: 上記の `update_buffer_level` 関数のコード断片に示されるように、バッファ内のデータ量 (`level`) が `jbuf->high_level` に達すると、`jbuf->buffering` フラグを `FALSE` に設定してバッファリング状態を解除し、パケットの供給を開始します。
+      * **`rtp_jitter_buffer_get_percent` (`rtpjitterbuffer.c`)**: バッファの使用率を計算する際に、`jbuf->high_level` を分母として使用します。
+
+これらの値は、特に `rtpjitterbuffer` が `mode=buffer` (GEnumValue `RTP_JITTER_BUFFER_MODE_BUFFER`) で動作している場合に、動的なバッファリング制御の中心的な役割を果たします。ネットワークの状況に応じてバッファリングを開始したり停止したりすることで、遅延を最小限に抑えつつ、再生の途切れを防ぐことを目指します。他のモード (例: `slave` モード) では、これらの水位マークに基づくバッファリング制御はアクティブにはならず、主に `jbuf->delay` がタイムアウトや PTS 計算の基準として参照されます。
+
+> rtpjitterbufferのlatencyプロパティによる出力バッファの遅延とPTSの関係を教えてください。
+
+`rtpjitterbuffer` の `latency` プロパティは、出力バッファの**実際の遅延時間 (出力されるタイミング)** と、そのバッファに付与される **PTS (Presentation Time Stamp)** の両方に影響を与えます。この2つは密接に関連していますが、同一ではありません。
+
+以下にその関係性を解説します。
+
+### 1\. 出力バッファの遅延 (出力タイミング) への影響
+
+  * **基本的な役割**: `latency` プロパティは、`rtpjitterbuffer` がRTPパケットを内部に保持する目標時間を定義します。つまり、受信したパケットは、この `latency` の期間が経過するまで（あるいは他の条件が満たされるまで）出力されません。
+  * **ジッター吸収と並べ替え**: この遅延時間を利用して、ネットワークジッター（パケット到着時間の揺らぎ）を吸収し、順序が入れ替わって到着したパケットを正しい順序に並べ替えます。
+  * **パケットのリリース**:
+      * 通常、パケットは `latency` の期間が経過するのを待ってから、適切なタイミングで下流にプッシュされます。
+      * `do-lost=true` の場合、`latency` を超えても到着しないパケットは欠落とみなされ、そのタイミングで（もしキューの先頭にあれば）次の処理（欠落イベントの発行や後続パケットのプッシュ）に進みます。
+      * `faststart-min-packets` が設定されている場合、`latency` を待たずに、指定された数の連続したパケットが到着すれば、より早くパケットの出力を開始することがあります。この場合でも、PTSの計算ロジックは維持されますが、実際の出力タイミングが早まります。
+
+ソースコードでは、主に `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_loop` 関数が、内部のタイマー (`wait_next_timeout` で管理) やイベントに基づいて、バッファをいつ下流にプッシュするかを決定しています。このタイマーの期限切れのタイミングは、`latency` (や `rtx-retry-period` など他の設定) に影響を受けます。
+
+```c
+/* gstrtpjitterbuffer.c の wait_next_timeout 関数内 */
+// (len は priv->timers の長さ)
+for (i = 0; i < len;) {
+  TimerData *test = &g_array_index (priv->timers, TimerData, i);
+  // get_timeout は latency_ns (latency プロパティのナノ秒表現) を考慮してタイムアウト値を計算
+  GstClockTime test_timeout = get_timeout (jitterbuffer, test);
+  // ...
+  if (test->type == TIMER_TYPE_LOST &&
+      (test_timeout == -1 || test_timeout <= now)) {
+    // ... 欠落タイムアウト処理 ...
+  }
+  // ...
+  if (timer_timeout == -1 || timer_timeout <= now || priv->eos) {
+    // ... 即時タイムアウト処理 (DEADLINE や EOS など) ...
+  }
+  // ...
+  // gst_clock_new_single_shot_id と gst_clock_id_wait で実際の遅延を発生させる
+  id = priv->clock_id = gst_clock_new_single_shot_id (clock, sync_time);
+  // ...
+  ret = gst_clock_id_wait (id, &clock_jitter);
+  // ...
+}
+```
+
+この `sync_time` の計算には、タイマーの種類に応じて `latency` が考慮された `timer_timeout` が使われます。
+
+### 2\. 出力バッファの PTS への影響
+
+`latency` プロパティの値が直接的に出力PTSの計算式に含まれるわけではありませんが、間接的に影響を与えます。
+
+  * **PTS計算の基本**:
+      * `rtpjitterbuffer` のPTS計算 (`rtp_jitter_buffer_calculate_pts` 関数) は、主に受信パケットのRTPタイムスタンプと、そのパケットの到着時刻 (DTS)、そしてエレメントのベースタイム (`jbuf->base_time`) やRTPベースタイム (`jbuf->base_rtptime`) を用いて行われます。
+      * 目標は、送信側で意図された提示時刻を、受信側で可能な限り正確に再現することです。
+  * **`latency` の間接的な役割**:
+      * **基準時刻の安定化**: `latency` の期間バッファリングすることで、初期のパケット到着の揺らぎの影響を受けにくくなり、PTS計算の基準となる `jbuf->base_time` や `jbuf->base_rtptime` がより安定した値で設定されることに寄与します。
+      * **スキュー計算への影響**: `mode=slave` の場合、送信側と受信側のクロックスキューを計算します。`latency` によってバッファリングされることで、より多くのパケットサンプルに基づいてスキューが計算され、結果としてPTSの精度向上に繋がる可能性があります。
+      * **タイムスタンプの単調増加**: `rtp_jitter_buffer_calculate_pts` 内では、計算されたPTSが前の出力PTSよりも逆行しないように調整するロジックがあります。
+        ```c
+        /* rtpjitterbuffer.c の rtp_jitter_buffer_calculate_pts 関数内 */
+        if (G_LIKELY (pts != -1 && jbuf->prev_out_time != -1
+                && jbuf->prev_send_diff != -1)) {
+          if (G_UNLIKELY (
+                  /* if the server timestamps went up and the out_time backwards */
+                  (gstrtptime - jbuf->base_rtptime > jbuf->prev_send_diff
+                      && pts < jbuf->prev_out_time) ||
+                  /* if the server timestamps went backwards and the out_time forwards */
+                  (gstrtptime - jbuf->base_rtptime < jbuf->prev_send_diff
+                      && pts > jbuf->prev_out_time) ||
+                  /* if the server timestamps did not change */
+                  gstrtptime - jbuf->base_rtptime == jbuf->prev_send_diff)) {
+            GST_DEBUG ("backwards timestamps, using previous time");
+            pts = jbuf->prev_out_time; // 前の出力時刻を使用
+          }
+        }
+        ```
+        `latency` が適切に設定されていると、このような逆行が発生しにくくなり、よりスムーズなPTS列が生成されます。
+      * **リセット条件**: `rtp_jitter_buffer_calculate_pts` 内で、計算されたPTSに `jbuf->delay` (latencyプロパティから設定) を加えた値が、入力DTSよりも著しく早い場合 (サーバーが一時停止した可能性など)、ジッターバッファをリセットし、PTSをDTSに設定する処理があります。
+        ```c
+        /* rtpjitterbuffer.c の rtp_jitter_buffer_calculate_pts 関数内 */
+        if (dts != -1 && pts + jbuf->delay < dts) {
+          GST_DEBUG ("out %" GST_TIME_FORMAT " + %" G_GUINT64_FORMAT " < time %"
+              GST_TIME_FORMAT ", reset jitterbuffer", GST_TIME_ARGS (pts),
+              jbuf->delay, GST_TIME_ARGS (dts));
+          rtp_jitter_buffer_resync (jbuf, dts, gstrtptime, ext_rtptime, TRUE);
+          pts = dts;
+        }
+        ```
+        この `jbuf->delay` は `latency` プロパティから来ています。このチェックは、過度なバッfaリングによる不自然なタイムスタンプのずれを防ぎます。
+
+### まとめ
+
+  * **出力遅延**: `latency` プロパティは、出力バッファが実際に下流にプッシュされるまでの**物理的な遅延時間**を直接的に決定します。これによりジッターを吸収します。
+  * **PTS**:
+      * `latency` は、出力バッファのPTS計算式に直接項として現れるわけではありません。PTSは主にRTPタイムスタンプと到着時刻に基づいて計算されます。
+      * しかし、`latency` によるバッファリングは、PTS計算の基準となる値の安定化や、スキュー計算の精度向上に寄与し、結果としてより正確で滑らかなPTS列の生成を助けます。
+      * また、PTSが入力DTSに対して早すぎる場合の補正処理において、`latency` (内部的には `jbuf->delay`) が判断基準として使われます。
+
+したがって、`latency` プロパティは、単に出力タイミングを遅らせるだけでなく、タイムスタンプの連続性や正確性にも間接的に良い影響を与えるように設計されています。ただし、`latency` を大きくしすぎると、全体の遅延が許容範囲を超える可能性があるため、適切なバランスが求められます。
+
+> rtpjitterbufferのlatencyプロパティが影響するタイマーの処理をソースコードを例示しながら解説してください。
+
+`rtpjitterbuffer` の `latency` プロパティは、内部で管理されるタイマーの動作にいくつかの形で影響を与えます。これらのタイマーは、パケットの到着遅延、欠落、再送要求などを処理するために使用されます。
+
+`latency` プロパティの値 (`priv->latency_ns` としてナノ秒単位で保持) は、主に以下のタイマー関連の処理で考慮されます。
+
+1.  **デッドラインタイマー (初期バッファリングおよび最初のパケット出力)**
+
+      * 最初にパケットを受信した際、または大きなギャップの後にストリームが再開された際、`rtpjitterbuffer` はすぐにはパケットを出力しません。代わりに、「デッドラインタイマー」を設定します。
+
+      * このタイマーのタイムアウト値は、最初の有効なパケットの計算済みPTSに `priv->latency_ns` を加えた時刻になることが一般的です。これにより、`latency` で指定された時間だけバッファリングを行い、その間に後続のパケットが到着して順序が整うのを待ちます。
+
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_chain` 関数内で、最初のパケット (`expected == -1` の場合) に対して `set_timer` が呼び出され、`TIMER_TYPE_DEADLINE` のタイマーが設定されます。このタイマーの `timeout` は、`rtp_jitter_buffer_calculate_pts` で計算されたPTSです。
+
+        ```c
+        /* gstrtpjitterbuffer.c の gst_rtp_jitter_buffer_chain 関数内 */
+        if (G_UNLIKELY (expected == -1)) { // expected は priv->next_in_seqnum
+          GST_DEBUG_OBJECT (jitterbuffer, "First buffer #%d", seqnum);
+
+          /* calculate a pts based on rtptime and arrival time (dts) */
+          pts =
+              rtp_jitter_buffer_calculate_pts (priv->jbuf, dts, estimated_dts,
+              rtptime, gst_element_get_base_time (GST_ELEMENT_CAST (jitterbuffer)));
+
+          /* we don't know what the next_in_seqnum should be, wait for the last
+           * possible moment to push this buffer, maybe we get an earlier seqnum
+           * while we wait */
+          // この set_timer で TIMER_TYPE_DEADLINE が設定される。
+          // timeout 値は計算された pts。実際のタイムアウト処理は wait_next_timeout で latency を考慮。
+          set_timer (jitterbuffer, TIMER_TYPE_DEADLINE, seqnum, pts);
+
+          do_next_seqnum = TRUE;
+          /* take rtptime and pts to calculate packet spacing */
+          priv->ips_rtptime = rtptime;
+          priv->ips_pts = pts;
+        }
+        ```
+
+      * そして、`wait_next_timeout` 関数内でこのタイマーが処理される際、`get_timeout` 関数が呼び出されます。`TIMER_TYPE_DEADLINE` の場合、計算されたPTS (`timer->timeout`) に `priv->latency_ns` が加算されて実際のタイムアウト時刻 (`test_timeout`) が決定されます。
+
+        ```c
+        /* gstrtpjitterbuffer.c の get_timeout 関数内 */
+        static GstClockTime
+        get_timeout (GstRtpJitterBuffer * jitterbuffer, TimerData * timer)
+        {
+          GstRtpJitterBufferPrivate *priv = jitterbuffer->priv;
+          GstClockTime test_timeout;
+
+          if ((test_timeout = timer->timeout) == -1) // timer->timeout は pts
+            return -1;
+
+          if (timer->type != TIMER_TYPE_EXPECTED) { // DEADLINE や LOST の場合
+            /* add our latency and offset to get output times. */
+            test_timeout = apply_offset (jitterbuffer, test_timeout);
+            test_timeout += priv->latency_ns; // ここで latency が加算される
+          }
+          return test_timeout;
+        }
+        ```
+
+      * このタイマーが満了すると (`do_deadline_timeout` が呼ばれる)、`priv->next_seqnum` が確定し、パケットの出力処理が開始されます。
+
+2.  **欠落パケットタイマー (`TIMER_TYPE_LOST`)**
+
+      * パケットが期待通りに到着せず、ギャップが検出された場合、その欠落パケットに対するタイマーが設定されます。
+
+      * `do-lost=TRUE` の場合、このタイマーが満了すると（つまり、`latency` で設定された期間を考慮してもパケットが到着しないと判断されると）、`GstRTPPacketLost` イベントが生成され、内部的に `ITEM_TYPE_LOST` としてキューに追加されます。
+
+      * `gstrtpjitterbuffer.c` の `calculate_expected` 関数では、ギャップがある場合に `add_timer` を呼び出し、`TIMER_TYPE_LOST` (または `do-retransmission=TRUE` なら `TIMER_TYPE_EXPECTED`) のタイマーを設定します。
+
+      * このタイマーのタイムアウト計算 (`get_timeout` 内) も、上記と同様に `priv->latency_ns` を考慮します。これにより、`latency` の期間だけパケットの到着を待ってから「欠落」と判断します。
+
+        ```c
+        /* gstrtpjitterbuffer.c の calculate_expected 関数内 */
+        if (priv->do_retransmission) {
+            // ... type = TIMER_TYPE_EXPECTED; ...
+        } else {
+            type = TIMER_TYPE_LOST; // do_retransmission=FALSE なら LOST タイマー
+        }
+        // ...
+        while (gst_rtp_buffer_compare_seqnum (expected, seqnum) > 0) {
+            add_timer (jitterbuffer, type, expected, 0, expected_pts, delay, duration);
+            // ...
+        }
+        ```
+
+      * `wait_next_timeout` 内でこの `TIMER_TYPE_LOST` のタイマーが満了すると (`do_lost_timeout` が呼ばれる)、パケットが実際に失われたと判断され、対応する処理が行われます。
+
+3.  **再送要求期間 (`rtx-retry-period`) の自動計算への影響**
+
+      * `do-retransmission=TRUE` かつ `rtx-retry-period` プロパティが `-1` (自動) に設定されている場合、`rtpjitterbuffer` は再送要求を試みる期間を推定します。
+
+      * この推定において、`priv->latency_ns` が考慮されます。具体的には、`get_rtx_retry_period` 関数内で、観測されたRTT (Round Trip Time) が `latency_ns` より大きい場合は再送期間を0とし、そうでなければ `latency_ns` からRTTを引いた値を再送期間とします。
+
+        ```c
+        /* gstrtpjitterbuffer.c の get_rtx_retry_period 関数内 */
+        static GstClockTime
+        get_rtx_retry_period (GstRtpJitterBufferPrivate * priv,
+            GstClockTime rtx_retry_timeout)
+        {
+          GstClockTime rtx_retry_period;
+
+          if (priv->rtx_retry_period == -1) { // rtx-retry-period が自動設定の場合
+            /* we retry up to the configured jitterbuffer size but leaving some
+             * room for the retransmission to arrive in time */
+            if (rtx_retry_timeout > priv->latency_ns) { // RTT が latency より大きい
+              rtx_retry_period = 0;
+            } else {
+              rtx_retry_period = priv->latency_ns - rtx_retry_timeout; // latency から RTT を引く
+            }
+          } else {
+            rtx_retry_period = priv->rtx_retry_period * GST_MSECOND;
+          }
+          return rtx_retry_period;
+        }
+        ```
+
+      * これにより、`latency` が大きいほど、より長い期間、欠落パケットの再送を試みることができます。
+
+4.  **`drop-on-latency` の動作**
+
+      * `drop-on-latency=TRUE` の場合、ジッターバッファ内のRTPタイムスタンプの範囲 (`rtp_jitter_buffer_get_ts_diff`) が `latency` プロパティで指定された時間 (`latency_ts`) を超えると、最も古いパケットが破棄されます。
+
+      * このチェックは `gst_rtp_jitter_buffer_chain` 関数内で行われ、直接的なタイマー処理ではありませんが、`latency` に基づいてバッファの最大保持期間を制限するものです。
+
+        ```c
+        /* gstrtpjitterbuffer.c の gst_rtp_jitter_buffer_chain 関数内 */
+        if (priv->latency_ms && priv->drop_on_latency) {
+            latency_ts = // latency_ms を clock_rate に基づいて RTP タイムスタンプ単位に変換
+                gst_util_uint64_scale_int (priv->latency_ms, priv->clock_rate, 1000);
+
+            if (G_UNLIKELY (rtp_jitter_buffer_get_ts_diff (priv->jbuf) >= latency_ts)) {
+              // バッファ内の期間が latency_ts を超えたら古いパケットをドロップ
+              // ... (ドロップ処理) ...
+            }
+        }
+        ```
+
+これらの処理を通じて、`latency` プロパティは、パケットがいつ出力されるか、いつ欠落と見なされるか、そして再送がどの程度の期間試みられるかといった、`rtpjitterbuffer` の時間に関連する多くの側面に影響を与えます。
+
+> rtpjitterbufferが出力バッファに設定したPTSが下流のエレメントで無視される場合、latencyプロパティで設定された遅延時間はどのような影響を与えますか。
+
+`rtpjitterbuffer` が出力バッファに設定したPTS (Presentation Time Stamp) が、下流のエレメント (例: デコーダやシンク) で**完全に無視される**というシナリオを考えます。この場合、`latency` プロパティで設定された遅延時間は、主に以下の点でパイプライン全体の動作に影響を与えます。
+
+1.  **出力バッファの物理的なタイミング**:
+
+      * たとえPTSが無視されたとしても、`rtpjitterbuffer` は `latency` プロパティに基づいて、受信したRTPパケットを一定時間内部で保持（バッファリング）します。
+      * つまり、`rtpjitterbuffer` からバッファが下流にプッシュされる**物理的なタイミング**は、`latency` の設定値によって遅延します。
+      * 下流のエレメントがPTSを見ずに、到着した順にバッファを処理する場合、`latency` が大きいほど、最初のデータが表示/再生されるまでの初期遅延が大きくなります。
+
+2.  **ジッター吸収とパケット並べ替えの恩恵**:
+
+      * PTSが無視される場合でも、`latency` によって確保されたバッファリング期間は、ネットワークジッターの吸収や、順序が入れ替わったパケットの並べ替えに役立ちます。
+
+      * これにより、下流のエレメントが受信するバッファの順序はより正しくなり、データ自体の連続性が向上する可能性があります。例えば、ビデオフレームが正しい順序でデコーダに渡れば、表示の乱れを防ぐことができます。
+
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_chain` 関数内でパケットが内部の `RTPJitterBuffer` (`priv->jbuf`) に挿入される際、シーケンス番号に基づいてソートされます。このソート処理が有効に働くためには、ある程度の `latency` が必要です。
+
+        ```c
+        /* gstrtpjitterbuffer.c の gst_rtp_jitter_buffer_chain 関数内 */
+        // ... (seqnum, rtptime などの取得) ...
+        if (G_UNLIKELY (!rtp_jitter_buffer_insert (priv->jbuf, item, &head,
+                          &percent))) {
+            // ... (重複パケット処理) ...
+        }
+        ```
+
+        `rtp_jitter_buffer_insert` (実際には `rtpjitterbuffer.c` の `rtp_jitter_buffer_insert`) は、シーケンス番号順にアイテムを挿入します。
+
+3.  **欠落パケットの処理 (`do-lost`)**:
+
+      * `do-lost` プロパティが `TRUE` の場合、`latency` の期間内に到着しなかったパケットは欠落とみなされ、`GstRTPPacketLost` イベントが発行されます。
+      * 下流のエレメントがPTSを無視するとしても、この欠落イベント自体は受信する可能性があります。デペイローダーなどがこのイベントを解釈して、欠落パケットの補間処理（例えば、音声なら無音挿入、映像なら前フレームの表示維持など）を行う場合、`latency` の設定は「いつ欠落と判断するか」の基準として依然として重要です。
+      * `wait_next_timeout` 関数内で `TIMER_TYPE_LOST` のタイマーが処理される際 (`do_lost_timeout` が呼ばれる)、`latency` を考慮したタイムアウト計算がなされています。
+
+4.  **再送要求 (`do-retransmission`)**:
+
+      * `do-retransmission` プロパティが `TRUE` の場合、パケットが期待通りに到着しないと判断された際に再送要求イベントがアップストリームに送信されます。
+      * この「期待通りに到着しない」の判断や、再送を試みる期間 (`rtx-retry-period` の自動計算) には、`latency` が間接的に関わっています。
+      * 下流がPTSを無視するとしても、`rtpjitterbuffer` が欠落パケットを再送によって取得できれば、下流に渡されるデータの完全性は向上します。`latency` の設定は、再送パケットが到着するのを待つ時間的な余裕に影響します。
+
+5.  **パイプライン全体のライブ性 (Live Synchronization)**:
+
+      * `rtpjitterbuffer` はライブエレメントとして動作し、パイプラインのレイテンシ計算に自身の `latency` を加算します。
+
+      * 下流がPTSを無視していても、GStreamerのパイプライン全体の同期メカニズム（クロック同期やライブエレメント間のレイテンシネゴシエーション）は、`rtpjitterbuffer` が報告する `latency` を考慮する場合があります。これにより、例えばオーディオとビデオの同期（リップシンク）が、PTSとは別のレベルで行われようとする場合、`latency` がその挙動に影響を与える可能性があります。
+
+      * `gstrtpjitterbuffer.c` の `gst_rtp_jitter_buffer_src_query` 関数内で `GST_QUERY_LATENCY` を処理する際、自身の `latency_ns` をピアレイテンシに加算して報告しています。
+
+        ```c
+        /* gstrtpjitterbuffer.c の gst_rtp_jitter_buffer_src_query 関数内 */
+        case GST_QUERY_LATENCY:
+        {
+          // ... (ピアレイテンシを取得) ...
+          JBUF_LOCK (priv);
+          priv->peer_latency = min_latency;
+          our_latency = priv->latency_ns; // ここで自身の latency を使用
+          JBUF_UNLOCK (priv);
+
+          min_latency += our_latency; // 自身の latency を加算
+          max_latency = -1;
+
+          gst_query_set_latency (query, TRUE, min_latency, max_latency);
+          // ...
+        }
+        ```
+
+### まとめ
+
+下流のエレメントが `rtpjitterbuffer` の出力PTSを無視する場合でも、`latency` プロパティは以下の点で影響を与え続けます。
+
+  * **データの到着タイミング**: パケットが物理的に下流に渡されるタイミングが遅延します。
+  * **データの品質**: ジッター吸収とパケット並べ替えによって、下流に渡されるデータの順序性と連続性が向上する可能性があります。
+  * **欠落・再送処理**: パケットがいつ欠落したと判断されるか、いつ再送要求が行われるかの基準時間に影響し、結果的に下流に渡るデータの完全性に影響します。
+  * **パイプライン同期**: GStreamerフレームワークレベルでの同期（特にライブソースの場合）に影響を与える可能性があります。
+
+したがって、たとえPTSが直接利用されないシナリオであっても、`latency` プロパティはストリームの安定性や品質、そしてパイプライン全体の挙動に対して重要な役割を果たします。
+
+> latencyプロパティがパイプラインに影響を与えないという現象はどのような条件の場合発生しますか。
+
+`rtpjitterbuffer` の `latency` プロパティは、受信したRTPパケットを処理し、下流に送り出す際の遅延時間やタイミング制御に深く関わっています。しかし、特定の条件下では、この `latency` プロパティがパイプラインの**体感的な遅延や最終的な出力品質にほとんど影響を与えない、あるいは意図した通りに機能しない**ように見える現象が発生し得ます。
+
+いくつかの条件を以下に挙げます。
+
+1.  **ネットワーク状態が極めて良好な場合 (ジッターやパケットロスがほぼ無い)**:
+
+      * `latency` プロパティの主な目的の一つは、ネットワークの揺らぎ（ジッター）を吸収し、パケットの順序を整えることです。
+      * ネットワークが非常に安定しており、パケットがほぼ時間通りに、かつ正しい順序で到着する場合、`rtpjitterbuffer` が行うべき補正処理はほとんどありません。
+      * このような状況では、`latency` を大きな値に設定しても、実際にその時間分だけパケットが保持されるわけではなく、`faststart-min-packets` の条件を満たせば、または他のタイマーロジックにより、比較的早期にパケットが出力される可能性があります。結果として、`latency` の設定値が実際の遅延に直結しないように見えることがあります。
+      * ソースコードの `gst_rtp_jitter_buffer_fast_start` 関数や、`wait_next_timeout` 内の各種タイマー処理がこれに関わります。特にデッドラインタイマーは、最初のパケット群が揃えば `latency` 期間待たずに動き出す可能性があります。
+
+2.  **`mode` プロパティが `RTP_JITTER_BUFFER_MODE_NONE` または `RTP_JITTER_BUFFER_MODE_BUFFER` 以外の場合**:
+
+      * **`RTP_JITTER_BUFFER_MODE_SLAVE` (デフォルト)**: このモードでは、受信側クロックを送信側クロックに同期させようとします。`latency` は依然としてパケット保持の目標時間や欠落判断の基準として機能しますが、クロックスキューの補正が主目的となるため、純粋な遅延時間としての意味合いは `BUFFER` モードほど直接的ではありません。実際の遅延は、検出されたスキューやパケットの到着タイミングに大きく左右されます。
+      * **`RTP_JITTER_BUFFER_MODE_SYNCED`**: 送信側と受信側のクロックが既に同期していることを前提とします。このモードでも `latency` はパケットの並べ替えや一時的な保持には使われますが、積極的な遅延追加というよりは、同期されたタイムスタンプに基づいた出力が優先されます。
+
+3.  **`drop-on-latency` プロパティが `FALSE` (デフォルト) で、かつ下流が非常に高速にデータを消費する場合**:
+
+      * `drop-on-latency` が `FALSE` の場合、ジッターバッファは `latency` を超えてもパケットを保持し続けることができます（メモリ上限に達するまで）。
+      * もし下流のエレメント（デコーダやシンク）が非常に高速にデータを引き取り、`rtpjitterbuffer` の内部キューが常に空に近い状態であれば、パケットは `latency` で設定された時間まで待たずに、到着次第すぐに処理されて下流に渡される可能性があります。
+      * この場合、`latency` プロパティはバッファの最大許容期間としての意味合いが薄れ、実際の遅延への影響は小さくなります。
+      * `gst_rtp_jitter_buffer_loop` 関数内で `handle_next_buffer` が呼び出され、キューに処理すべきバッファがあれば速やかに出力しようとします。
+
+4.  **`faststart-min-packets` プロパティによる早期開始**:
+
+      * `faststart-min-packets` が0より大きい値に設定されている場合、指定された数の連続したパケットが到着すると、`latency` の期間が経過するのを待たずにパケットの出力を開始します。
+
+      * これにより、初期遅延を削減できますが、`latency` プロパティが意図する遅延時間よりも早くデータが流れ始めるため、`latency` の影響が限定的に見えることがあります。
+
+      * `gst_rtp_jitter_buffer_chain` 関数内の `gst_rtp_jitter_buffer_fast_start` の呼び出しがこれに該当します。
+
+        ```c
+        /* gstrtpjitterbuffer.c の gst_rtp_jitter_buffer_chain 関数内 */
+        if (gst_rtp_jitter_buffer_fast_start (jitterbuffer)) // faststart の条件をチェック
+          head = TRUE; // head が TRUE になると、ループが早く動き出す可能性がある
+
+        if (G_UNLIKELY (head)) {
+          if (G_LIKELY (priv->active))
+            JBUF_SIGNAL_EVENT (priv); // イベントを通知して出力ループを起動
+
+          if (G_UNLIKELY (priv->clock_id)) {
+            GST_DEBUG_OBJECT (jitterbuffer, "Unscheduling waiting new buffer");
+            unschedule_current_timer (jitterbuffer); // 既存のタイマーを解除
+          }
+        }
+        ```
+
+5.  **EOS (End Of Stream) 状態**:
+
+      * ストリームの終わりに近づき、EOS が送信されると、`rtpjitterbuffer` はバッファリング動作を変更し、残っているパケットを速やかに排出しようとします。
+      * `rtp_jitter_buffer_disable_buffering (priv->jbuf, TRUE);` が `GST_EVENT_EOS` 受信時に呼び出されます。
+      * また、`wait_next_timeout` 内で `priv->eos` が `TRUE` の場合、タイマーのタイムアウト値に関わらず処理を進めるロジックがあります。
+      * この状態では、`latency` プロパティによる遅延制御よりも、ストリームの確実な終了が優先されます。
+
+6.  **パイプラインの他の部分にボトルネックがある場合**:
+
+      * `rtpjitterbuffer` の下流に処理が重いエレメントがあり、そこがボトルネックとなってデータの流れが滞っている場合、`rtpjitterbuffer` が `latency` に基づいてパケットを保持していても、パイプライン全体の遅延は主にそのボトルネックによって決定されます。
+      * この場合、`rtpjitterbuffer` の `latency` を変更しても、全体の体感遅延には大きな変化が見られないことがあります。
+
+7.  **`latency` が極端に小さい値に設定されている場合**:
+
+      * `latency` が非常に小さい値（例: 0に近い値）に設定されている場合、ジッター吸収やパケット並べ替えのための十分な時間が確保できません。
+      * パケットはほぼ到着した順に出力され、`latency` プロパティによる遅延効果はほとんど見られなくなります。ただし、この設定ではジッターバッファとしての本来の機能は十分に発揮されません。
+
+これらの条件下では、`latency` プロパティが直接的にパイプラインの遅延や動作に影響を与えているとは感じられないかもしれません。しかし、内部的には `latency` の値に基づいて各種タイマーやバッファ管理の閾値が設定されており、間接的にはストリームの安定性や品質に寄与している点を理解することが重要です。多くの場合、`latency` は他の要因との組み合わせでその効果を発揮します。
