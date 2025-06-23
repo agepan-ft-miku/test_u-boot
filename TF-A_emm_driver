@@ -1,0 +1,123 @@
+承知いたしました。
+先ほどの図をさらに詳細化し、TF-A I/OフレームワークからRenesas RZ/GのeMMC物理ドライバまでの主要な関数単位での関係性を示した図を作成します。
+
+### TF-A I/OフレームワークとRenesas eMMCドライバの詳細な関係図 (関数レベル)
+
+```mermaid
+graph TD
+    subgraph " "
+        direction LR
+        subgraph "TF-A Application Layer (e.g., BL2)"
+            A[load_image()]
+        end
+
+        subgraph "TF-A I/O Framework (Generic)"
+            C[io_open()]
+            R[io_read()]
+            S[io_seek()]
+            CL[io_close()]
+        end
+    end
+
+
+    subgraph "High-Level Driver: io_emmcdrv.c"
+        direction LR
+        subgraph "Device Registration (at init time)"
+            INIT[io_emmcdrv_init()] --> REG[io_register_driver]
+            REG -- "Registers 'emmc_dev_ops'" --> FW_CONN(I/O Framework<br>dev_connector)
+        end
+
+        subgraph "Device Operations (struct 'emmc_dev_ops')"
+            OPEN[emmc_dev_open()]
+            CLOSE[emmc_dev_close()]
+        end
+
+        subgraph "File Operations (struct 'emmc_file_ops')"
+            READ[emmc_block_read()]
+            SEEK[emmc_block_seek()]
+            LEN[emmc_block_len()]
+        end
+    end
+
+    subgraph "Low-Level Driver: emmc_mmc.c / emmc_std.c"
+        direction LR
+        subgraph "Public API"
+             L_INIT[emmc_init()]
+             L_READ[emmc_read_sector()]
+             L_SELECT[emmc_select_partition()]
+        end
+        subgraph "Internal Functions"
+            L_CMD[emmc_exec_cmd()]
+            L_SEND[emmc_send_cmd()]
+        end
+    end
+
+    subgraph "Hardware Abstraction: emmc_def.h"
+        DEF[Register Definitions<br>EMMC_CMD, EMMC_ARG, ...<br>CMD17, CMD6, ...]
+    end
+
+    subgraph "Physical Hardware"
+        direction LR
+        HW_CTRL[(eMMC Host<br>Controller)]
+        HW_DEV[(eMMC Device)]
+    end
+
+
+    %% API Call Flow
+    A -- "1. Reads image metadata" --> C
+    C -- "2. Calls 'dev_open' from connector" --> OPEN
+    OPEN -- "3. Selects Boot/User partition" --> L_SELECT
+    A -- "4. Reads file content" --> R
+    R -- "5. Calls 'read' from handle" --> READ
+    READ -- "6. Reads one or more sectors" --> L_READ
+    L_READ -- "7. Sends CMD17 (READ_SINGLE_BLOCK)" --> L_CMD
+    L_CMD -- "8. Sets registers and waits" --> L_SEND
+    L_SEND -- "9. Accesses HW registers" --> HW_CTRL
+    HW_CTRL -- "10. MMC protocol commands" --> HW_DEV
+
+    %% Initialization Flow
+    INIT -- "Calls" --> L_INIT
+    L_INIT -- "Initializes controller" --> L_CMD
+
+    %% Dependencies
+    OPEN --> L_SELECT
+    L_SELECT --> L_CMD
+    L_READ --> L_CMD
+    L_CMD --> L_SEND
+    L_SEND --> DEF
+    style FW_CONN fill:#f9f,stroke:#333,stroke-width:2px
+```
+
+-----
+
+### 図の詳細な解説
+
+#### 初期化（Initialization Flow）
+
+1.  TF-Aの初期化フェーズで、`plat_io_setup()`（図には不記載）が `io_emmcdrv_init()` を呼び出します。
+2.  `io_emmcdrv_init()`【INIT】は、2つの重要な処理を行います。
+      * まず、低レベルドライバの`emmc_init()`【L\_INIT】を呼び出し、eMMCホストコントローラを初期化し、eMMCデバイスを通信可能な状態にします。
+      * 次に、`io_register_driver()`【REG】を呼び出し、自身のデバイス操作関数群（`emmc_dev_ops`）をI/Oフレームワークのコネクタ【FW\_CONN】に登録します。これにより、フレームワークは「eMMC」という種類のデバイスを扱えるようになります。
+
+#### ファイル読み出しフロー（API Call Flow）
+
+1.  **`load_image()`【A】**: BL31などのイメージを読み込むために、まず`io_open()`【C】を呼び出します。このとき、ファイル識別子（どのパーティションのどのFIPか）を渡します。
+2.  **`io_open()`【C】**: 渡された識別子から、これがeMMCデバイスだと判断し、初期化時に登録された`emmc_dev_ops`の中から`emmc_dev_open()`【OPEN】を呼び出します。
+3.  **`emmc_dev_open()`【OPEN】**:
+      * ファイル識別子を解析し、アクセスすべきeMMCのパーティション（例: Boot Area Partition 1）を決定します。
+      * 低レベルドライバの`emmc_select_partition()`【L\_SELECT】を呼び出し、`CMD6` (SWITCH)を発行して目的のパーティションを有効化します。
+      * 成功すると、ファイル操作用の関数群（`emmc_file_ops`）が設定されたデバイスハンドルを返します。
+4.  **`load_image()`【A】**: `io_open()`から受け取ったハンドルを使い、`io_read()`【R】を呼び出して実際のデータを要求します。
+5.  **`io_read()`【R】**: デバイスハンドルに紐付けられた`emmc_block_read()`【READ】を呼び出します。
+6.  **`emmc_block_read()`【READ】**:
+      * 読み込むべきバイト数を、eMMCのセクタ（ブロック）数に換算します。
+      * 必要なセクタ数だけループし、低レベルドライバの`emmc_read_sector()`【L\_READ】を呼び出します。
+7.  **`emmc_read_sector()`【L\_READ】**:
+      * 内部で`emmc_exec_cmd()`【L\_CMD】を呼び出し、`CMD17` (READ\_SINGLE\_BLOCK) と読み出し先のセクタアドレスを引数として渡します。
+8.  **`emmc_exec_cmd()`【L\_CMD】**:
+      * さらに内部の`emmc_send_cmd()`【L\_SEND】を呼び出して、コマンドとアーギュメントをeMMCコントローラのレジスタ (`EMMC_CMD`, `EMMC_ARG`) に書き込みます。
+      * コマンド完了、またはタイムアウトするまでステータスレジスタを監視（ポーリング）します。
+9.  **`emmc_send_cmd()`【L\_SEND】**: `emmc_def.h`【DEF】で定義されたレジスタアドレスを元に、eMMCホストコントローラ【HW\_CTRL】に物理的にアクセスします。
+10. **eMMC Host Controller【HW\_CTRL】**: CPUからの指示に基づき、eMMCデバイス【HW\_DEV】とMMCプロトコルで通信を行い、データを読み出します。
+
+この一連の流れにより、最上位のアプリケーション層はハードウェアの詳細から完全に隔離され、汎用的なAPIを通じてeMMCデバイスを利用できます。
