@@ -1,0 +1,47 @@
+承知いたしました。ご指定のドライバファイル群とTrusted Firmware-AのI/Oフレームワークがどのように連携しているか、主要な関数・定義を一覧にまとめ、その関係性も示します。
+
+これらのドライバは、TF-Aの汎用的なI/Oフレームワークに対して、特定のハードウェア（eMMCまたはSPI Flash）を操作するための具体的な実装を提供する「バックエンド」として機能します。
+
+-----
+
+### 1\. eMMCドライバ関連 (`io_emmcdrv.c` と `emmc/`)
+
+eMMCからのイメージ読み込みは、以下のコンポーネント間の連携によって実現されます。
+
+| 階層 | コンポーネント/ファイル | 主要な関数/定義 | 役割と関係性 |
+| :--- | :--- | :--- | :--- |
+| **TF-A Application** | `bl_main.c`など | `load_image()` | イメージロードの起点。I/OフレームワークのAPIを呼び出して、ストレージデバイスからBL31などのイメージをメモリにロードする。 |
+| **TF-A I/O Framework** | `io_driver.c`\<br\>`io_storage.c` | `io_register_driver()`\<br\>`io_open()`\<br\>`io_read()` | **汎用I/Oインターフェース層**: \<br\>・`io_register_driver()`: ドライバ（バックエンド）をフレームワークに登録する。\<br\>・`io_open()`: アプリケーションからの要求に応じて、登録済みのドライバから適切な`dev_open`関数を呼び出し、デバイスハンドルを返す。\<br\>・`io_read()`: ハンドルを介して、ドライバの`read`関数を呼び出す。 |
+| | | `io_dev_info_t`\<br\>`io_dev_ops_t` | **ドライバ登録用構造体**: \<br\>・`io_dev_info_t`: ドライバ情報と `io_dev_ops_t` へのポインタを持つ。\<br\>・`io_dev_ops_t`: `dev_open`などのデバイス操作関数のポインタを保持する。 |
+| **High-Level Driver** | `io_emmcdrv.c` | `io_emmcdrv_init()` | **eMMC用 高レベルドライバ初期化**: \<br\>・`plat_io_setup()`から呼ばれる。\<br\>・低レベルドライバの`emmc_init()`を呼び出してHWを初期化する。\<br\>・`io_register_driver()`を呼び出し、自身の`emmc_dev_ops`をI/Oフレームワークに登録する。 |
+| | | `emmc_dev_open()` | **デバイスオープン処理**: \<br\>・`io_open()`からコールバックされる。\<br\>・eMMCのパーティション（Boot/User）を選択するために`emmc_select_partition()`を呼び出す。\<br\>・ファイル操作用の`emmc_file_ops`が設定されたデバイスハンドルを返す。 |
+| | | `emmc_block_read()` | **データ読み出し処理**: \<br\>・`io_read()`からコールバックされる。\<br\>・要求されたバイト数をセクタ数に変換し、低レベルドライバの`emmc_read_sector()`を呼び出す。 |
+| **Low-Level Driver** | `emmc/emmc_init.c`\<br\>`emmc/emmc_read.c`\<br\>`emmc/emmc_mount.c` | `emmc_init()`\<br\>`emmc_read_sector()`\<br\>`emmc_select_partition()`\<br\>`emmc_exec_cmd()` | **eMMCコントローラ 物理ドライバ**: \<br\>・`emmc_init()`: eMMCコントローラのレジスタ設定、クロック供給、デバイスとの初期シーケンスを実行する。\<br\>・`emmc_read_sector()`: 指定されたセクタからデータを物理的に読み出す。\<br\>・`emmc_select_partition()`: eMMC内のアクセス対象パーティションを切り替える。\<br\>・`emmc_exec_cmd()`: `CMD17`(READ)などのMMCコマンドをコントローラに送信する。 |
+
+-----
+
+### 2\. SPI Flashドライバ関連 (`plat_storage.c` と `AT25QL128A/`)
+
+QSPI Flashからのイメージ読み込みも、eMMCと類似した階層構造で実現されます。`plat_storage.c`が汎用的な高レベルドライバとして機能し、その配下で具体的なチップドライバ（`AT25QL128A`）が切り替え可能になっています。
+
+| 階層 | コンポーネント/ファイル | 主要な関数/定義 | 役割と関係性 |
+| :--- | :--- | :--- | :--- |
+| **TF-A Application** | `bl_main.c`など | `load_image()` | イメージロードの起点。I/OフレームワークAPIを呼び出す。（eMMCの場合と同様） |
+| **TF-A I/O Framework** | `io_driver.c`\<br\>`io_storage.c` | `io_register_driver()`\<br\>`io_open()`\<br\>`io_read()` | **汎用I/Oインターフェース層**: （eMMCの場合と同様） |
+| | | `io_dev_info_t`\<br\>`io_dev_ops_t` | **ドライバ登録用構造体**: （eMMCの場合と同様） |
+| **High-Level Driver** | `plat_storage.c` | `plat_storage_init()` | **SPI Flash用 高レベルドライバ初期化**: \<br\>・`plat_io_setup()`から呼ばれる。\<br\>・`spi_multi_init()`を呼び出し、`AT25QL128A`などのチップ固有ドライバを初期化させる。\<br\>・`io_register_driver()`を呼び出し、自身の`storage_dev_ops`をI/Oフレームワークに登録する。 |
+| | | `storage_dev_open()` | **デバイスオープン処理**: \<br\>・`io_open()`からコールバックされる。\<br\>・Flashメモリ上のFIPヘッダを読み込み、目的のイメージの場所を特定する。\<br\>・ファイル操作用の`storage_file_ops`が設定されたデバイスハンドルを返す。 |
+| | | `storage_read()` | **データ読み出し処理**: \<br\>・`io_read()`からコールバックされる。\<br\>・`spi_multi_ops.read`関数ポインタ経由で、物理ドライバの`AT25QL128A_read()`を呼び出す。 |
+| **Mid-Level Driver** | `spi_multi/spi_multi.c` | `spi_multi_init()`\<br\>`spi_multi_ops_t` | **SPIチップドライバ抽象化層**: \<br\>・`spi_multi_init()`: 複数のSPIチップの中から、実際に接続されているチップ（例: AT25QL128A）の`init`関数を呼び出す。\<br\>・`spi_multi_ops_t`: `read`, `write`, `erase`などの関数ポインタを保持する構造体。`AT25QL128A`ドライバは、初期化時にこの構造体へ自身の関数ポインタを登録する。 |
+| **Low-Level Driver** | `spi_multi/AT25QL128A/` | `AT25QL128A_init()`\<br\>`AT25QL128A_read()` | **`AT25QL128A`チップ固有ドライバ**: \<br\>・`AT25QL128A_init()`: チップIDの確認やQPIモードへの移行など、チップ固有の初期化を行う。\<br\>・`AT25QL128A_read()`: `FAST_READ`コマンドなど、チップの仕様に合わせたコマンドをSoCのRPC（SPIコントローラ）経由で発行し、データを物理的に読み出す。 |
+
+### `register_io_dev_memmap` との関係
+
+上記に加えて、しばしば`register_io_dev_memmap`が登場します。これは物理ドライバとは異なる役割を持ちます。
+
+| 階層 | コンポーネント/ファイル | 主要な関数/定義 | 役割と関係性 |
+| :--- | :--- | :--- | :--- |
+| **TF-A I/O Framework** | `io_memmap.c` | `register_io_dev_memmap()` | **メモリマップI/Oデバイス登録**: \<br\>・指定されたメモリ領域（DRAM上など）を、ファイルのように見せかける「memmap」デバイスをI/Oフレームワークに登録する。\<br\>・このデバイスへの`io_read()`は、物理的なI/Oを伴わず、`memcpy()`によって処理される。 |
+| **Platform Setup** | `bl2_plat_setup.c`など | `plat_io_setup()` | **I/O初期化**: \<br\>・**ブートシナリオに応じて**、物理ドライバ（`plat_storage_init`など）を登録するか、`register_io_dev_memmap`を呼び出すかを選択する。\<br\>・多くの場合、BootROMが既にFlashからDRAMへFIPをロードしているため、BL2は`register_io_dev_memmap`を呼び出してDRAM上のFIPを直接読み込む。 |
+
+このように、TF-AのI/Oフレームワークは、アプリケーション（BL2）と具体的なドライバ実装（物理チップ or メモリマップ）を綺麗に分離する設計になっています。
